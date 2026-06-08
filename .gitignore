@@ -1,4 +1,5 @@
 /target
+.continuum/
 **/*.rs.bk
 *.db
 *.db-shm
