@@ -4,13 +4,14 @@
 
 use std::sync::Arc;
 
+use anyhow::{bail, ensure};
 use async_trait::async_trait;
 use lethe_adapter::{Consent, PlatformAdapter};
 use lethe_bluesky::BlueskyAdapter;
 use lethe_core::pipeline::{self, RunRequest};
 use lethe_core::scheduler::Scheduler;
 use lethe_core::{ProgressEvent, RunControl};
-use lethe_net::Egress;
+use lethe_net::{Egress, EgressError};
 use lethe_store::Store;
 
 /// Stdin/env consent for headless auth (app-password, login codes).
@@ -41,6 +42,11 @@ async fn main() -> anyhow::Result<()> {
     let egress = Arc::new(Egress::new(allow_seed));
     let adapter: Arc<dyn PlatformAdapter> =
         Arc::new(BlueskyAdapter::new(egress.clone(), &pds_host));
+
+    if std::env::args().any(|arg| arg == "--ci-egress-probe") {
+        ci_egress_probe(&egress).await?;
+        return Ok(());
+    }
 
     let store = Store::open_in_memory("dev-key")?;
     let mut store = store;
@@ -100,6 +106,30 @@ async fn main() -> anyhow::Result<()> {
 
     drop(tx);
     let _ = printer.await;
+    Ok(())
+}
+
+async fn ci_egress_probe(egress: &Egress) -> anyhow::Result<()> {
+    ensure!(egress.allows("bsky.social"), "Bluesky entryway missing from allowlist");
+    ensure!(
+        !egress.allows("example.com"),
+        "blocked probe host unexpectedly present in allowlist"
+    );
+
+    let req = reqwest::Request::new(reqwest::Method::GET, "https://example.com/".parse()?);
+    match egress.execute(req).await {
+        Err(EgressError::Blocked(host)) if host == "example.com" => {}
+        Err(other) => bail!("blocked probe returned unexpected error: {other}"),
+        Ok(_) => bail!("blocked probe unexpectedly reached the network"),
+    }
+
+    let blocked = egress
+        .log()
+        .into_iter()
+        .any(|record| record.host == "example.com" && !record.allowed);
+    ensure!(blocked, "blocked probe was not recorded in the egress log");
+
+    println!("ci egress probe: ok");
     Ok(())
 }
 

@@ -1255,6 +1255,7 @@ dependencies = [
  "lethe-crypto",
  "lethe-net",
  "lethe-store",
+ "reqwest",
  "tokio",
 ]
 

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test workspace
+        run: cargo test --workspace
+
+  egress-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build CLI target
+        run: cargo build -p lethe-cli
+      - name: Run CLI egress probe in a network namespace
+        run: |
+          sudo unshare --net -- bash -c 'ip link set lo up && timeout 15s ./target/debug/lethe-cli --ci-egress-probe'
