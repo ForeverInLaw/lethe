@@ -1,0 +1,27 @@
+[package]
+name = "lethe-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Orchestration. Owns the two-phase pipeline, per-account rate scheduler, the
+# filter predicate, and run control (pause/stop/resume). UI-agnostic: progress
+# is emitted over an mpsc channel the app forwards to the Tauri Channel.
+
+[dependencies]
+lethe-adapter.workspace = true
+lethe-net.workspace = true
+lethe-store.workspace = true
+lethe-crypto.workspace = true
+
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+time.workspace = true
+uuid.workspace = true
+regex.workspace = true
+unicode-normalization = "0.1"

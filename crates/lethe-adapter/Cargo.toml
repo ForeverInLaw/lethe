@@ -1,0 +1,18 @@
+[package]
+name = "lethe-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The contract every platform plugs into. Transport-agnostic by design:
+# an HTTP adapter and a browser-driving session adapter (M3) satisfy the
+# same trait. NO transport types (reqwest, http) may appear in this crate's
+# public API.
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+time.workspace = true
+url.workspace = true

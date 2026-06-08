@@ -1,0 +1,23 @@
+[package]
+name = "lethe-bluesky"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# M1 tracer. AT Protocol via atrium. Auth = app-password createSession (debt:
+# swap to OAuth before ship). Delete = repo.applyWrites/deleteRecord (batch).
+# Routes HTTP through lethe-net::Egress — never its own client.
+
+[dependencies]
+lethe-adapter.workspace = true
+lethe-net.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+time.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-stream = "0.3"
+atrium-api = { workspace = true, features = ["agent"] }
+atrium-xrpc-client.workspace = true

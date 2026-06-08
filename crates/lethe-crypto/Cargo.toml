@@ -1,0 +1,18 @@
+[package]
+name = "lethe-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# One crypto dependency covers everything:
+#   - archive AEAD  : dryoc::dryocstream (XChaCha20-Poly1305, chunked streaming)
+#   - receipts      : dryoc::sign (Ed25519 detached)
+# Envelope keys: Argon2id(passphrase) wraps a random data-key (portable),
+# OS keychain wraps the same data-key (convenient) — wiring lives in the app.
+
+[dependencies]
+dryoc.workspace = true
+argon2.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true

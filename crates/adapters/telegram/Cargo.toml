@@ -1,0 +1,22 @@
+[package]
+name = "lethe-telegram"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# M1 integration #3. MTProto via grammers (pure-Rust; avoids TDLib's C++ dep).
+# api_id/api_hash are INJECTED (BYO-first) — zero secrets in this crate, so a
+# ban hits one user, not all. Batch delete = messages.deleteMessages (list).
+#
+# NOTE: MTProto opens raw TCP to Telegram DCs (not HTTP through lethe-net). The
+# DC endpoints are declared in the descriptor so the egress sandbox allowlists
+# them. Re-validate grammers vs TDLib before building this out.
+
+# grammers-client 0.9.0 currently fails to resolve (grammers-crypto -> yanked
+# glass_pumpkin 1.10.0). Add the MTProto SDK at the TG milestone after picking
+# grammers vs TDLib and confirming a clean dep graph.
+[dependencies]
+lethe-adapter.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+thiserror.workspace = true

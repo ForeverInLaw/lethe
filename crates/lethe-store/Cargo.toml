@@ -1,0 +1,17 @@
+[package]
+name = "lethe-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Encrypted SQLite (SQLCipher). One DB = checkpoints + activity log + receipts.
+# Idempotency key = (run_id, platform_id). Resume = WHERE state='pending'.
+# The proprietary compliance generator only READS this (open-core clean).
+
+[dependencies]
+lethe-adapter.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+time.workspace = true
+serde.workspace = true
+serde_json.workspace = true
