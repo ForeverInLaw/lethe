@@ -149,7 +149,7 @@ pub struct Engagement {
     pub views: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaRef {
     pub url: String,
     pub mime: Option<String>,

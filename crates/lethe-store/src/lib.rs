@@ -2,7 +2,7 @@
 //!
 //! The connection is keyed with `PRAGMA key` before any other statement.
 
-use lethe_adapter::{ContentType, ItemRef, Outcome};
+use lethe_adapter::{ContentType, ItemRef, MediaRef, Outcome};
 use rusqlite::{params, Connection};
 
 mod state;
@@ -24,8 +24,21 @@ pub struct ItemSnapshot {
     pub item_ref: ItemRef,
     pub content_type: ContentType,
     pub created_at_secs: Option<i64>,
+    pub text: Option<String>,
+    pub media: Vec<MediaRef>,
     /// `protected` when matched by the allow-list/pin predicate, else `pending`.
     pub state: ItemState,
+}
+
+/// Phase-2 projection: delete routing plus the immutable content captured in
+/// Phase 1 for backup-before-delete.
+#[derive(Debug, Clone)]
+pub struct PendingItem {
+    pub item_ref: ItemRef,
+    pub content_type: ContentType,
+    pub created_at_secs: Option<i64>,
+    pub text: Option<String>,
+    pub media: Vec<MediaRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +71,7 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "key", key)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+        migrate_content_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -66,6 +80,7 @@ impl Store {
         let conn = Connection::open_in_memory()?;
         conn.pragma_update(None, "key", key)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+        migrate_content_columns(&conn)?;
         Ok(Self { conn })
     }
 
@@ -100,16 +115,19 @@ impl Store {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO items
-                 (run_id, platform_id, content_type, created_at, token, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (run_id, platform_id, content_type, created_at, token, text, media_json, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             for it in items {
+                let media_json = serde_json::to_string(&it.media)?;
                 stmt.execute(params![
                     run_id,
                     it.item_ref.platform_id,
                     content_type_str(it.content_type),
                     it.created_at_secs,
                     it.item_ref.token,
+                    it.text,
+                    media_json,
                     it.state.as_str(),
                 ])?;
             }
@@ -143,14 +161,44 @@ impl Store {
 
     /// Phase-2: claim up to `n` rows still `pending` for the next delete batch.
     pub fn claim_pending_batch(&self, run_id: &str, n: usize) -> Result<Vec<ItemRef>> {
+        Ok(self
+            .claim_pending_items(run_id, n)?
+            .into_iter()
+            .map(|item| item.item_ref)
+            .collect())
+    }
+
+    pub fn claim_pending_items(&self, run_id: &str, n: usize) -> Result<Vec<PendingItem>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT platform_id, token FROM items
+            "SELECT platform_id, token, content_type, created_at, text, media_json FROM items
              WHERE run_id = ?1 AND state = 'pending' LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![run_id, n as i64], |r| {
-            Ok(ItemRef {
-                platform_id: r.get(0)?,
-                token: r.get::<_, Option<String>>(1)?,
+            let content_type: String = r.get(2)?;
+            let media_json: String = r.get(5)?;
+            let media = serde_json::from_str(&media_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+            let content_type = content_type_from_str(&content_type).map_err(|msg| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
+                )
+            })?;
+            Ok(PendingItem {
+                item_ref: ItemRef {
+                    platform_id: r.get(0)?,
+                    token: r.get::<_, Option<String>>(1)?,
+                },
+                content_type,
+                created_at_secs: r.get(3)?,
+                text: r.get(4)?,
+                media,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -213,6 +261,38 @@ fn content_type_str(ct: ContentType) -> &'static str {
     }
 }
 
+fn content_type_from_str(ct: &str) -> std::result::Result<ContentType, String> {
+    match ct {
+        "post" => Ok(ContentType::Post),
+        "comment" => Ok(ContentType::Comment),
+        "reaction" => Ok(ContentType::Reaction),
+        "media" => Ok(ContentType::Media),
+        "dm" => Ok(ContentType::Dm),
+        _ => Err(format!("unknown content type: {ct}")),
+    }
+}
+
+fn migrate_content_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "items", "text")? {
+        conn.execute("ALTER TABLE items ADD COLUMN text TEXT", [])?;
+    }
+    if !column_exists(conn, "items", "media_json")? {
+        conn.execute("ALTER TABLE items ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]'", [])?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    for name in rows {
+        if name? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +302,8 @@ mod tests {
             item_ref: ItemRef { platform_id: id.into(), token: None },
             content_type: ContentType::Post,
             created_at_secs: Some(1),
+            text: Some(format!("text {id}")),
+            media: vec![MediaRef { url: format!("https://cdn/{id}"), mime: Some("text/plain".into()) }],
             state,
         }
     }
@@ -257,6 +339,9 @@ mod tests {
         // Protected is never claimed for deletion.
         let batch = s.claim_pending_batch("r", 100).unwrap();
         assert_eq!(batch.len(), 2);
+        let rich = s.claim_pending_items("r", 100).unwrap();
+        assert_eq!(rich[0].text.as_deref(), Some("text 1"));
+        assert_eq!(rich[0].media.len(), 1);
 
         s.record_outcomes(
             "r",

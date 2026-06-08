@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use lethe_adapter::{EnumeratePlan, Item, Outcome, PlatformAdapter};
+use lethe_adapter::{EnumeratePlan, Item, MediaRef, Outcome, PlatformAdapter};
 use lethe_crypto::container::ContainerWriter;
 use lethe_crypto::receipt::{ReceiptSigner, RunSummary, SignedReceipt};
 use lethe_crypto::DataKey;
@@ -59,6 +59,10 @@ struct BackupManifest<'a> {
 struct BackupItem<'a> {
     platform_id: &'a str,
     token: Option<&'a str>,
+    content_type: &'a str,
+    created_at_secs: Option<i64>,
+    text: Option<&'a str>,
+    media: &'a [MediaRef],
 }
 
 fn to_json(value: &impl serde::Serialize) -> Result<Vec<u8>> {
@@ -120,6 +124,8 @@ pub async fn snapshot(
                 item_ref: item.item_ref.clone(),
                 content_type: item.content_type,
                 created_at_secs: item.created_at.map(|t| t.unix_timestamp()),
+                text: item.text.clone(),
+                media: item.media.clone(),
                 state,
             });
         }
@@ -187,19 +193,22 @@ pub async fn execute(
             continue;
         }
 
-        let batch = store.claim_pending_batch(&req.run_id, DELETE_BATCH)?;
+        let batch = store.claim_pending_items(&req.run_id, DELETE_BATCH)?;
         if batch.is_empty() {
             break;
         }
 
-        // Backup-before-delete. (Media-blob capture is still TODO: it needs the
-        // enumerated content persisted in Phase 1; today we archive the item
-        // refs, which is the deletion manifest for legal handoff.)
+        // Backup-before-delete. Phase 1 captured text + media refs; fetching
+        // large media bytes remains an adapter-level follow-up.
         if let Some(w) = writer.as_mut() {
             for item in &batch {
                 let record = BackupItem {
-                    platform_id: &item.platform_id,
-                    token: item.token.as_deref(),
+                    platform_id: &item.item_ref.platform_id,
+                    token: item.item_ref.token.as_deref(),
+                    content_type: content_type_str(item.content_type),
+                    created_at_secs: item.created_at_secs,
+                    text: item.text.as_deref(),
+                    media: &item.media,
                 };
                 w.write_chunk(&to_json(&record)?)?;
             }
@@ -208,7 +217,8 @@ pub async fn execute(
         // Rate gate (one token per delete call; adapter batches internally).
         scheduler.bucket(&req.account_id, &policy).acquire().await;
 
-        let outcomes = adapter.delete(&batch).await;
+        let delete_refs: Vec<_> = batch.iter().map(|item| item.item_ref.clone()).collect();
+        let outcomes = adapter.delete(&delete_refs).await;
 
         // Terminal outcomes are checkpointed. Rate-limited items stay pending
         // and are retried after the scheduler applies the platform delay.
@@ -224,7 +234,7 @@ pub async fn execute(
                     continue;
                 }
             }
-            records.push((item.platform_id.clone(), result));
+            records.push((item.item_ref.platform_id.clone(), result));
         }
         if !records.is_empty() {
             store.record_outcomes(&req.run_id, &records)?;
@@ -254,6 +264,16 @@ pub async fn execute(
     // builds a `RunSummary` from this `RunOutcome` and calls `store_receipt`.
     let _ = progress.send(ProgressEvent::Done { run_id: req.run_id.clone() });
     Ok(outcome)
+}
+
+fn content_type_str(ct: lethe_adapter::ContentType) -> &'static str {
+    match ct {
+        lethe_adapter::ContentType::Post => "post",
+        lethe_adapter::ContentType::Comment => "comment",
+        lethe_adapter::ContentType::Reaction => "reaction",
+        lethe_adapter::ContentType::Media => "media",
+        lethe_adapter::ContentType::Dm => "dm",
+    }
 }
 
 #[cfg(test)]
@@ -310,7 +330,10 @@ mod tests {
                         text: Some(format!("post {i}")),
                         engagement: Engagement::default(),
                         scope_id: None,
-                        media: vec![],
+                        media: vec![MediaRef {
+                            url: format!("https://cdn.fake/{i}"),
+                            mime: Some("text/plain".into()),
+                        }],
                         item_ref: ItemRef {
                             platform_id: format!("at://fake/app.bsky.feed.post/{i}"),
                             token: Some(format!("app.bsky.feed.post:{i}")),
@@ -429,10 +452,17 @@ mod tests {
         let file = File::open(&path).unwrap();
         let mut reader = ContainerReader::open(file, &key).unwrap();
         let mut chunks = 0;
-        while reader.read_chunk().unwrap().is_some() {
+        let mut first_item = None;
+        while let Some(chunk) = reader.read_chunk().unwrap() {
+            if first_item.is_none() && chunks == 1 {
+                first_item = Some(chunk);
+            }
             chunks += 1;
         }
         assert_eq!(chunks, n + 1, "manifest + one record per deleted item");
+        let first_item: serde_json::Value = serde_json::from_slice(&first_item.unwrap()).unwrap();
+        assert_eq!(first_item["text"], "post 0");
+        assert_eq!(first_item["media"][0]["url"], "https://cdn.fake/0");
         std::fs::remove_file(&path).ok();
 
         // Re-running deletes nothing (idempotent: no rows left pending).
