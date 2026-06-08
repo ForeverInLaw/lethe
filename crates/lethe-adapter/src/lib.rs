@@ -188,6 +188,7 @@ pub enum Outcome {
     Deleted,
     Skipped { reason: String },
     Failed { reason: String, retryable: bool },
+    RateLimited { retry_after_secs: u64 },
 }
 
 /// Base limits the core scheduler seeds its per-account token bucket from

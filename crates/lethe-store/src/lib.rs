@@ -170,6 +170,7 @@ impl Store {
                     Outcome::Deleted => ("deleted", None),
                     Outcome::Skipped { reason } => ("skipped", Some(reason.as_str())),
                     Outcome::Failed { reason, .. } => ("failed", Some(reason.as_str())),
+                    Outcome::RateLimited { .. } => ("pending", Some("rate limited")),
                 };
                 stmt.execute(params![state, err, run_id, platform_id])?;
             }

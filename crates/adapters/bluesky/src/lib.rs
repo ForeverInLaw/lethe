@@ -238,7 +238,9 @@ impl BlueskyAdapter {
             Ok(_) => Outcome::Deleted,
             Err(e) => match map_err(e) {
                 AdapterError::NotFound => Outcome::Deleted,
-                AdapterError::RateLimited { .. } => failed("rate limited".into(), true),
+                AdapterError::RateLimited { retry_after_secs } => {
+                    Outcome::RateLimited { retry_after_secs }
+                }
                 AdapterError::Transport(m) => failed(m, true),
                 other => failed(other.to_string(), false),
             },

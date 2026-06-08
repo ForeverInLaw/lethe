@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use lethe_adapter::{EnumeratePlan, Item, Outcome, PlatformAdapter};
@@ -209,17 +210,25 @@ pub async fn execute(
 
         let outcomes = adapter.delete(&batch).await;
 
-        // Map already-gone -> Deleted (idempotent), tally, persist in a txn.
+        // Terminal outcomes are checkpointed. Rate-limited items stay pending
+        // and are retried after the scheduler applies the platform delay.
         let mut records = Vec::with_capacity(outcomes.len());
+        let mut retry_after_secs: Option<u64> = None;
         for (item, result) in batch.iter().zip(outcomes) {
             match &result {
                 Outcome::Deleted => outcome.deleted += 1,
                 Outcome::Skipped { .. } => outcome.skipped += 1,
                 Outcome::Failed { .. } => outcome.failed += 1,
+                Outcome::RateLimited { retry_after_secs: secs } => {
+                    retry_after_secs = Some(retry_after_secs.map_or(*secs, |current| current.max(*secs)));
+                    continue;
+                }
             }
             records.push((item.platform_id.clone(), result));
         }
-        store.record_outcomes(&req.run_id, &records)?;
+        if !records.is_empty() {
+            store.record_outcomes(&req.run_id, &records)?;
+        }
 
         let _ = progress.send(ProgressEvent::Deleting {
             deleted: outcome.deleted,
@@ -228,8 +237,12 @@ pub async fn execute(
             total,
         });
 
-        // TODO(pipeline): on AdapterError::RateLimited, call
-        // scheduler.bucket(..).penalize(retry_after) and emit Throttled.
+        if let Some(wait_secs) = retry_after_secs {
+            let bucket = scheduler.bucket(&req.account_id, &policy);
+            let rate_per_sec = bucket.rate_per_sec();
+            let _ = progress.send(ProgressEvent::Throttled { rate_per_sec, wait_secs });
+            bucket.penalize(Duration::from_secs(wait_secs)).await;
+        }
     }
 
     // Seal the archive (emits the FINAL frame; truncation is now detectable).
@@ -255,6 +268,7 @@ mod tests {
     use lethe_crypto::container::ContainerReader;
     use lethe_crypto::receipt::{verify, ReceiptSigner, RunSummary};
     use lethe_store::{NewRun, Store};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Adapter that enumerates N posts and reports every delete as success.
     struct FakeAdapter {
@@ -313,6 +327,42 @@ mod tests {
 
         fn rate_policy(&self) -> RatePolicy {
             RatePolicy { max_per_sec: 1000.0, max_per_min: None, burst: 1000 }
+        }
+    }
+
+    struct RateLimitOnceAdapter {
+        inner: FakeAdapter,
+        calls: AtomicUsize,
+    }
+
+    impl RateLimitOnceAdapter {
+        fn new() -> Self {
+            Self {
+                inner: FakeAdapter::with_items(1),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for RateLimitOnceAdapter {
+        fn descriptor(&self) -> &Descriptor {
+            self.inner.descriptor()
+        }
+
+        async fn enumerate(&self, plan: &EnumeratePlan) -> std::result::Result<ItemStream, AdapterError> {
+            self.inner.enumerate(plan).await
+        }
+
+        async fn delete(&self, items: &[ItemRef]) -> Vec<Outcome> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return items.iter().map(|_| Outcome::RateLimited { retry_after_secs: 0 }).collect();
+            }
+            items.iter().map(|_| Outcome::Deleted).collect()
+        }
+
+        fn rate_policy(&self) -> RatePolicy {
+            self.inner.rate_policy()
         }
     }
 
@@ -413,5 +463,58 @@ mod tests {
         };
         let receipt = store_receipt(&store, &signer, &summary).unwrap();
         assert!(verify(&receipt).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_penalizes_without_checkpointing_as_failed() {
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(RateLimitOnceAdapter::new());
+        let mut store = Store::open_in_memory("test-key").unwrap();
+        let mut scheduler = Scheduler::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let req = RunRequest {
+            run_id: "rl".into(),
+            platform: "fake".into(),
+            account_id: "fake:a".into(),
+            account_label: "acc".into(),
+            plan: EnumeratePlan::default(),
+            filter: match_all_filter(),
+            backup: false,
+        };
+        store
+            .create_run(&NewRun {
+                run_id: req.run_id.clone(),
+                platform: req.platform.clone(),
+                account: req.account_label.clone(),
+                filter_json: "{}".into(),
+                started_secs: 0,
+            })
+            .unwrap();
+
+        let counts = snapshot(adapter.clone(), &store, &req, &tx).await.unwrap();
+        assert_eq!(counts.pending, 1);
+
+        let outcome = execute(
+            adapter,
+            &mut store,
+            &mut scheduler,
+            &req,
+            RunControl::new(),
+            &tx,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(store.preview_counts(&req.run_id).unwrap().failed, 0);
+
+        let mut saw_throttled = false;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, ProgressEvent::Throttled { wait_secs: 0, .. }) {
+                saw_throttled = true;
+            }
+        }
+        assert!(saw_throttled, "rate-limit event must reach progress stream");
     }
 }
