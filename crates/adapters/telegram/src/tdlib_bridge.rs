@@ -57,6 +57,21 @@ pub struct TelegramChatScope {
     pub cleanability: TelegramCleanability,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelegramMessageKind {
+    Text,
+    Media,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramMessageRef {
+    pub chat_id: i64,
+    pub message_id: i64,
+    pub sent_at_epoch_secs: i32,
+    pub kind: TelegramMessageKind,
+}
+
 pub async fn list_chat_ids(client_id: TdlibClientId, limit: i32) -> Result<Vec<i64>, AdapterError> {
     let chats = functions::get_chats(Some(enums::ChatList::Main), limit, client_id.raw())
         .await
@@ -82,6 +97,33 @@ pub async fn list_chat_scopes(
     }
 
     Ok(scopes)
+}
+
+pub async fn list_own_message_page(
+    client_id: TdlibClientId,
+    chat_id: i64,
+    current_user_id: i64,
+    from_message_id: i64,
+    limit: i32,
+) -> Result<Vec<TelegramMessageRef>, AdapterError> {
+    let messages =
+        functions::get_chat_history(chat_id, from_message_id, 0, limit, false, client_id.raw())
+            .await
+            .map_err(map_tdlib_error)?;
+
+    let enums::Messages::Messages(messages) = messages;
+    Ok(messages
+        .messages
+        .into_iter()
+        .flatten()
+        .filter(|message| is_from_user(message, current_user_id))
+        .map(|message| TelegramMessageRef {
+            chat_id: message.chat_id,
+            message_id: message.id,
+            sent_at_epoch_secs: message.date,
+            kind: classify_message_content(&message.content),
+        })
+        .collect())
 }
 
 pub async fn delete_message_batch(
@@ -122,6 +164,33 @@ fn classify_chat_type(chat_type: &enums::ChatType) -> TelegramChatKind {
         }
         enums::ChatType::Supergroup(_) => TelegramChatKind::Group,
         enums::ChatType::Secret(_) => TelegramChatKind::Secret,
+    }
+}
+
+fn is_from_user(message: &types::Message, current_user_id: i64) -> bool {
+    matches!(
+        &message.sender_id,
+        enums::MessageSender::User(sender) if sender.user_id == current_user_id
+    )
+}
+
+fn classify_message_content(content: &enums::MessageContent) -> TelegramMessageKind {
+    match content {
+        enums::MessageContent::MessageText(_) => TelegramMessageKind::Text,
+        enums::MessageContent::MessageAnimation(_)
+        | enums::MessageContent::MessageAudio(_)
+        | enums::MessageContent::MessageDocument(_)
+        | enums::MessageContent::MessagePaidMedia(_)
+        | enums::MessageContent::MessagePhoto(_)
+        | enums::MessageContent::MessageSticker(_)
+        | enums::MessageContent::MessageVideo(_)
+        | enums::MessageContent::MessageVideoNote(_)
+        | enums::MessageContent::MessageVoiceNote(_)
+        | enums::MessageContent::MessageExpiredPhoto
+        | enums::MessageContent::MessageExpiredVideo
+        | enums::MessageContent::MessageExpiredVideoNote
+        | enums::MessageContent::MessageExpiredVoiceNote => TelegramMessageKind::Media,
+        _ => TelegramMessageKind::Other,
     }
 }
 

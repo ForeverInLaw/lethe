@@ -29,7 +29,8 @@ depend on the proprietary `untrace` tree.**
 ## Status
 
 M1 scaffold with the Bluesky tracer live. Telegram has a narrow TDLib bridge for
-chat-scope discovery and message batch deletion behind feature gates:
+chat-scope discovery, own-message page enumeration, and message batch deletion
+behind feature gates:
 
 - default builds do not link native TDLib;
 - `tdlib-docs` is for `cargo check` against generated TDLib bindings;
@@ -41,8 +42,7 @@ Current verification baseline:
 - `cargo check -p lethe-telegram --features tdlib-docs`
 - `cargo test --workspace`
 
-Next Lethe slice: TDLib authorization/session lifecycle and message enumeration,
-then wiring the Telegram adapter into the same snapshot -> backup -> delete
-pipeline proven by Bluesky.
+Next Lethe slice: wiring Telegram message pages into the same snapshot -> backup
+-> delete pipeline proven by Bluesky.
 
 License: AGPL-3.0-only.
