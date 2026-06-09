@@ -15,7 +15,7 @@ depend on the proprietary `untrace` tree.**
 | `lethe-core` | Two-phase pipeline, per-account scheduler, filter predicate, run control. |
 | `adapters/bluesky` | M1 tracer (AT Protocol). |
 | `adapters/vk` | M1 #2 (stub). |
-| `adapters/telegram` | M1 #3 (TDLib-gated stub, BYO api_id). |
+| `adapters/telegram` | M1 #3 (TDLib-gated bridge; auth/run path not live yet). |
 | `lethe-cli` | Headless vertical runner — reproducible-build & zero-egress CI target. |
 
 ## Invariants
@@ -34,5 +34,15 @@ chat-scope discovery and message batch deletion behind feature gates:
 - default builds do not link native TDLib;
 - `tdlib-docs` is for `cargo check` against generated TDLib bindings;
 - live builds must explicitly choose `tdlib-local` or `tdlib-download`.
+
+Current verification baseline:
+
+- `cargo check --workspace`
+- `cargo check -p lethe-telegram --features tdlib-docs`
+- `cargo test --workspace`
+
+Next Lethe slice: TDLib authorization/session lifecycle and message enumeration,
+then wiring the Telegram adapter into the same snapshot -> backup -> delete
+pipeline proven by Bluesky.
 
 License: AGPL-3.0-only.
