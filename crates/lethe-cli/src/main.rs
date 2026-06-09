@@ -2,12 +2,12 @@
 //! descriptor, runs Phase 1 (snapshot/preview) then Phase 2 (execute), and
 //! prints progress. CI runs this inside a network sandbox.
 
-use std::sync::Arc;
+use std::{env, sync::Arc};
 
 use anyhow::{bail, ensure};
 use async_trait::async_trait;
-use lethe_adapter::{Consent, PlatformAdapter};
-use lethe_bluesky::BlueskyAdapter;
+use lethe_adapter::{AuthProvider, Consent, PlatformAdapter};
+use lethe_bluesky::{BlueskyAdapter, BlueskyAuth};
 use lethe_core::pipeline::{self, RunRequest};
 use lethe_core::scheduler::Scheduler;
 use lethe_core::{ProgressEvent, RunControl};
@@ -23,16 +23,21 @@ impl Consent for CliConsent {
         eprintln!("[consent] {prompt} -> assuming yes (headless)");
         true
     }
-    async fn input(&self, prompt: &str, _secret: bool) -> Option<String> {
-        // TODO(cli): read from env (LETHE_BSKY_IDENT / LETHE_BSKY_APP_PASSWORD).
-        eprintln!("[input] {prompt}");
-        None
+    async fn input(&self, prompt: &str, secret: bool) -> Option<String> {
+        let key = env_key_for_prompt(prompt, secret)?;
+        match env::var(key) {
+            Ok(value) if !value.is_empty() => Some(value),
+            _ => {
+                eprintln!("[input] {prompt}: missing {key}");
+                None
+            }
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let pds_host = std::env::var("LETHE_PDS_HOST").unwrap_or_else(|_| "bsky.social".into());
+    let pds_host = env::var("LETHE_PDS_HOST").unwrap_or_else(|_| "bsky.social".into());
 
     // Build the adapter, then seed egress from its declared endpoints.
     let allow_seed: Vec<String> = {
@@ -40,19 +45,24 @@ async fn main() -> anyhow::Result<()> {
         probe.descriptor().endpoints.iter().map(|e| e.host.clone()).collect()
     };
     let egress = Arc::new(Egress::new(allow_seed));
-    let adapter: Arc<dyn PlatformAdapter> =
-        Arc::new(BlueskyAdapter::new(egress.clone(), &pds_host));
 
-    if std::env::args().any(|arg| arg == "--ci-egress-probe") {
+    if env::args().any(|arg| arg == "--ci-egress-probe") {
         ci_egress_probe(&egress).await?;
         return Ok(());
     }
+
+    let consent = CliConsent;
+    let auth = BlueskyAuth::new(egress.clone());
+    let credential = auth.connect(&consent).await?;
+
+    let mut adapter = BlueskyAdapter::new(egress.clone(), &pds_host);
+    adapter.authenticate(&credential).await?;
+    let adapter: Arc<dyn PlatformAdapter> = Arc::new(adapter);
 
     let store = Store::open_in_memory("dev-key")?;
     let mut store = store;
     let mut scheduler = Scheduler::new();
     let control = RunControl::new();
-    let _consent = CliConsent; // used once auth wiring lands
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ProgressEvent>();
     let printer = tokio::spawn(async move {
@@ -61,11 +71,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let run_id = env::var("LETHE_RUN_ID").unwrap_or_else(|_| format!("cli-{}", now_secs()));
     let req = RunRequest {
-        run_id: "dev-run".into(),
+        run_id,
         platform: "bluesky".into(),
-        account_id: "bluesky:dev".into(),
-        account_label: "dev".into(),
+        account_id: format!("bluesky:{}", credential.account_label),
+        account_label: credential.account_label,
         plan: Default::default(),
         filter: dev_filter(),
         backup: true,
@@ -81,6 +92,12 @@ async fn main() -> anyhow::Result<()> {
 
     let counts = pipeline::snapshot(adapter.clone(), &store, &req, &tx).await?;
     println!("preview: {counts:?}");
+
+    ensure!(
+        env::var("LETHE_CLI_CONFIRM_DELETE").as_deref() == Ok(req.run_id.as_str()),
+        "preview complete; set LETHE_CLI_CONFIRM_DELETE={} to execute deletion",
+        req.run_id
+    );
 
     // No backup target in the headless CLI run (no passphrase prompt); the
     // engine archives nothing but still produces a signed receipt below.
@@ -140,6 +157,17 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+fn env_key_for_prompt(prompt: &str, secret: bool) -> Option<&'static str> {
+    let prompt = prompt.to_ascii_lowercase();
+    if prompt.contains("handle") || prompt.contains("email") {
+        Some("LETHE_BSKY_IDENT")
+    } else if secret || prompt.contains("password") {
+        Some("LETHE_BSKY_APP_PASSWORD")
+    } else {
+        None
+    }
+}
+
 fn dev_filter() -> lethe_core::filter::FilterSpec {
     lethe_core::filter::FilterSpec {
         content_types: Default::default(),
@@ -148,5 +176,22 @@ fn dev_filter() -> lethe_core::filter::FilterSpec {
         keyword: None,
         engagement_max: None,
         allowlist_ids: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_key_for_prompt;
+
+    #[test]
+    fn maps_bluesky_prompts_to_env() {
+        assert_eq!(
+            env_key_for_prompt("Bluesky handle or email", false),
+            Some("LETHE_BSKY_IDENT")
+        );
+        assert_eq!(
+            env_key_for_prompt("Bluesky app password", true),
+            Some("LETHE_BSKY_APP_PASSWORD")
+        );
     }
 }
