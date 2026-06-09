@@ -15,7 +15,7 @@ depend on the proprietary `untrace` tree.**
 | `lethe-core` | Two-phase pipeline, per-account scheduler, filter predicate, run control. |
 | `adapters/bluesky` | M1 tracer (AT Protocol). |
 | `adapters/vk` | M1 #2 (stub). |
-| `adapters/telegram` | M1 #3 (stub, BYO api_id). |
+| `adapters/telegram` | M1 #3 (TDLib-gated stub, BYO api_id). |
 | `lethe-cli` | Headless vertical runner — reproducible-build & zero-egress CI target. |
 
 ## Invariants
@@ -28,9 +28,11 @@ depend on the proprietary `untrace` tree.**
 
 ## Status
 
-M1 scaffold. Contract crates (`lethe-adapter`, `lethe-net`, `filter`, `scheduler`)
-are implemented; pipeline Phase 1 is wired; adapter bodies and crypto/store
-internals are `todo!()` stubs to be filled following the tracer-bullet sequence
-in `../untrace/.claude/plans` (or the project plan).
+M1 scaffold with the Bluesky tracer live. Telegram has a narrow TDLib bridge for
+chat-scope discovery and message batch deletion behind feature gates:
+
+- default builds do not link native TDLib;
+- `tdlib-docs` is for `cargo check` against generated TDLib bindings;
+- live builds must explicitly choose `tdlib-local` or `tdlib-download`.
 
 License: AGPL-3.0-only.

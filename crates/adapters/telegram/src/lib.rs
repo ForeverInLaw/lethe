@@ -1,6 +1,13 @@
 //! Telegram adapter (M1 integration #3). Stub: descriptor + contract shell.
 //! `api_id`/`api_hash` are injected at construction (BYO-first) — never embedded.
 
+#[cfg(any(
+    feature = "tdlib-docs",
+    feature = "tdlib-local",
+    feature = "tdlib-download"
+))]
+pub mod tdlib_bridge;
+
 use async_trait::async_trait;
 use lethe_adapter::{
     AdapterError, Capabilities, ContentType, Descriptor, EnumeratePlan, ItemRef, ItemStream,
@@ -18,7 +25,7 @@ pub struct ApiCredentials {
 
 pub struct TelegramAdapter {
     descriptor: Descriptor,
-    // grammers Client + session; ApiCredentials injected by the app layer.
+    // TDLib client/session lives in the app layer until the auth vertical is wired.
 }
 
 impl TelegramAdapter {
@@ -30,8 +37,12 @@ impl TelegramAdapter {
             risk_class: RiskClass::Green,
             content_types: CONTENT_TYPES,
             pushdown: PUSHDOWN,
-            capabilities: Capabilities { can_redact: false, can_undo: false, batch_delete_max: 100 },
-            // Declared so the egress sandbox allowlists the MTProto DCs.
+            capabilities: Capabilities {
+                can_redact: false,
+                can_undo: false,
+                batch_delete_max: 100,
+            },
+            // Placeholder until the TDLib egress sandbox is explicit.
             endpoints: vec![lethe_adapter::Endpoint::host("api.telegram.org")],
         };
         Self { descriptor }
@@ -50,6 +61,10 @@ impl PlatformAdapter for TelegramAdapter {
         todo!("messages.deleteMessages (revoke=true), 100 ids per call")
     }
     fn rate_policy(&self) -> RatePolicy {
-        RatePolicy { max_per_sec: 20.0, max_per_min: Some(300), burst: 20 }
+        RatePolicy {
+            max_per_sec: 20.0,
+            max_per_min: Some(300),
+            burst: 20,
+        }
     }
 }

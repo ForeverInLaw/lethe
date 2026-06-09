@@ -51,8 +51,9 @@ rusqlite = { version = "0.40", features = ["bundled-sqlcipher", "serde_json"] }
 atrium-api = "0.25"
 atrium-xrpc-client = "0.5"
 bsky-sdk = "0.1"
-# grammers-client/-session: add at the TG milestone (0.9.0 currently pulls a
-# yanked glass_pumpkin via grammers-crypto).
+# Telegram uses tdlib-rs behind adapter-local feature gates. The docs feature
+# lets CI type-check the bridge without linking native TDLib; live builds must
+# opt in to local/download TDLib explicitly.
 # --- internal ---
 lethe-adapter = { path = "crates/lethe-adapter" }
 lethe-net = { path = "crates/lethe-net" }
