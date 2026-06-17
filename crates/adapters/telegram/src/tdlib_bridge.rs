@@ -70,6 +70,10 @@ pub struct TelegramMessageRef {
     pub message_id: i64,
     pub sent_at_epoch_secs: i32,
     pub kind: TelegramMessageKind,
+    /// Plain message text, captured so the backup archives recoverable content
+    /// rather than bare ids. ponytail: text only; media captions/bytes are the
+    /// documented adapter follow-up.
+    pub text: Option<String>,
 }
 
 pub async fn list_chat_ids(client_id: TdlibClientId, limit: i32) -> Result<Vec<i64>, AdapterError> {
@@ -122,6 +126,7 @@ pub async fn list_own_message_page(
             message_id: message.id,
             sent_at_epoch_secs: message.date,
             kind: classify_message_content(&message.content),
+            text: extract_message_text(&message.content),
         })
         .collect())
 }
@@ -191,6 +196,13 @@ fn classify_message_content(content: &enums::MessageContent) -> TelegramMessageK
         | enums::MessageContent::MessageExpiredVideoNote
         | enums::MessageContent::MessageExpiredVoiceNote => TelegramMessageKind::Media,
         _ => TelegramMessageKind::Other,
+    }
+}
+
+fn extract_message_text(content: &enums::MessageContent) -> Option<String> {
+    match content {
+        enums::MessageContent::MessageText(text) => Some(text.text.text.clone()),
+        _ => None,
     }
 }
 
