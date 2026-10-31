@@ -2,7 +2,7 @@
 
 Open-core deletion engine for Untrace. Adapters, orchestration,
 and crypto live here so behavior is verifiable — **no crate in this repo may
-depend on the proprietary `untrace` tree.**
+depend on `untrace`.**
 
 ## Crates
 

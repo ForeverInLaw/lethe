@@ -1,5 +1,5 @@
 # Lethe — open-core deletion engine (PUBLIC repo).
-# INVARIANT: no crate here may depend on the proprietary `untrace` tree.
+# INVARIANT: no crate here may depend on the `untrace` tree.
 # `lethe-cli` must build + run a full vertical with zero `untrace` deps
 # (it is the reproducible-build / zero-egress CI target).
 
