@@ -21,7 +21,7 @@ members = [
 version = "0.0.0"
 edition = "2021"
 license = "AGPL-3.0-only"
-repository = "https://github.com/UNSET/lethe"
+repository = "https://github.com/ForeverInLaw/lethe"
 
 [workspace.dependencies]
 # --- async / core ---
