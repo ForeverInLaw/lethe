@@ -15,7 +15,7 @@ depend on the proprietary `untrace` tree.**
 | `lethe-core` | Two-phase pipeline, per-account scheduler, filter predicate, run control. |
 | `adapters/bluesky` | M1 tracer (AT Protocol). |
 | `adapters/vk` | M1 #2 (stub). |
-| `adapters/telegram` | M1 #3 (TDLib-gated bridge; auth/run path not live yet). |
+| `adapters/telegram` | M1 #3 (TDLib-gated bridge; delete path not yet proven on a live account). |
 | `lethe-cli` | Headless vertical runner — reproducible-build & zero-egress CI target. |
 
 ## Invariants
@@ -42,7 +42,9 @@ Current verification baseline:
 - `cargo check -p lethe-telegram --features tdlib-docs`
 - `cargo test --workspace`
 
-Next Lethe slice: wiring Telegram message pages into the same snapshot -> backup
--> delete pipeline proven by Bluesky.
+Next Lethe slice: one Telegram run against a real account. Until then Telegram
+is wired but not claimed live.
+
+External contributions are not accepted yet: a CLA comes first.
 
 License: AGPL-3.0-only.
