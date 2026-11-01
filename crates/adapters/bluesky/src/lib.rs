@@ -9,20 +9,23 @@
 //! allowlist: `bsky.social` + the account PDS host. The adapter never builds its
 //! own client — that is the zero-egress invariant, structurally.
 
+use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::agent::atp_agent::{AtpAgent, AtpSession};
-use atrium_api::types::string::{AtIdentifier, Nsid, RecordKey};
-use atrium_api::types::TryFromUnknown;
+use atrium_api::types::string::{AtIdentifier, Did, Nsid, RecordKey};
+use atrium_api::types::{BlobRef, TryFromUnknown, TypedBlobRef, Unknown};
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use lethe_adapter::{
     AdapterError, AuthProvider, Capabilities, Consent, ContentType, Credential, Descriptor,
-    Engagement, EnumeratePlan, Item, ItemRef, ItemStream, Outcome, PlatformAdapter, PushdownDim,
+    Engagement, EnumeratePlan, FetchedMedia, Item, ItemRef, ItemStream, MediaRef, Outcome,
+    PlatformAdapter, PushdownDim,
     RatePolicy, Result, RiskClass, SecretBlob,
 };
 use lethe_net::Egress;
+use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -91,8 +94,8 @@ struct RecordValue {
 pub struct BlueskyAdapter {
     agent: Arc<Agent>,
     descriptor: Descriptor,
-    /// Authenticated repo (account DID). `None` until `authenticate` runs.
-    repo: Option<AtIdentifier>,
+    /// Authenticated account. `None` until `authenticate` runs.
+    did: Option<Did>,
 }
 
 impl BlueskyAdapter {
@@ -109,7 +112,7 @@ impl BlueskyAdapter {
                 lethe_adapter::Endpoint::host(pds_host.to_owned()),
             ],
         };
-        Self { agent: Arc::new(build_agent(&egress)), descriptor, repo: None }
+        Self { agent: Arc::new(build_agent(&egress)), descriptor, did: None }
     }
 
     /// Restore a stored session so `enumerate`/`delete` act as the account.
@@ -122,14 +125,18 @@ impl BlueskyAdapter {
             .resume_session(session)
             .await
             .map_err(|e| AdapterError::Auth(e.to_string()))?;
-        self.repo = Some(AtIdentifier::from(did));
+        self.did = Some(did);
         Ok(())
     }
 
-    fn repo(&self) -> Result<AtIdentifier> {
-        self.repo
+    fn did(&self) -> Result<Did> {
+        self.did
             .clone()
             .ok_or_else(|| AdapterError::Auth("adapter not authenticated".into()))
+    }
+
+    fn repo(&self) -> Result<AtIdentifier> {
+        self.did().map(AtIdentifier::from)
     }
 }
 
@@ -176,7 +183,7 @@ impl PlatformAdapter for BlueskyAdapter {
                         .map_err(map_err)?;
 
                     for rec in &out.records {
-                        yield record_to_item(rec, collection, ct);
+                        yield record_to_item(rec, collection, ct)?;
                     }
 
                     cursor = out.cursor.clone();
@@ -204,6 +211,44 @@ impl PlatformAdapter for BlueskyAdapter {
             outcomes.push(self.delete_one(&repo, item).await);
         }
         outcomes
+    }
+
+    async fn fetch_media(&self, _item: &ItemRef, media: &MediaRef) -> Result<FetchedMedia> {
+        let cid = media
+            .url
+            .parse()
+            .map_err(|e| AdapterError::Platform(format!("bad blob cid: {e}")))?;
+        let did = self.did()?;
+        let params = atrium_api::com::atproto::sync::get_blob::ParametersData { cid, did };
+        let bytes = self
+            .agent
+            .api
+            .com
+            .atproto
+            .sync
+            .get_blob(params.into())
+            .await
+            .map_err(|e| match map_err(e) {
+                // The file is gone, but the post may not be: core must not count it as deleted.
+                AdapterError::NotFound => {
+                    AdapterError::Platform("the PDS no longer has this file".into())
+                }
+                other => other,
+            })?;
+        if media.size.is_some_and(|size| size != bytes.len() as u64) {
+            return Err(AdapterError::Platform(
+                "the file could not be downloaded in full".into(),
+            ));
+        }
+
+        let mut file = tempfile::NamedTempFile::new().map_err(io_error)?;
+        file.write_all(&bytes).map_err(io_error)?;
+        let path = file.into_temp_path().keep().map_err(|e| io_error(e.error))?;
+        Ok(FetchedMedia { path, handle: 0 })
+    }
+
+    async fn release_media(&self, file: &FetchedMedia) -> Result<()> {
+        tokio::fs::remove_file(&file.path).await.map_err(io_error)
     }
 
     fn rate_policy(&self) -> RatePolicy {
@@ -248,6 +293,10 @@ impl BlueskyAdapter {
     }
 }
 
+fn io_error(error: std::io::Error) -> AdapterError {
+    AdapterError::Platform(format!("downloaded file: {error}"))
+}
+
 fn failed(reason: String, retryable: bool) -> Outcome {
     Outcome::Failed { reason, retryable }
 }
@@ -258,7 +307,7 @@ fn record_to_item(
     rec: &atrium_api::com::atproto::repo::list_records::Record,
     collection: &str,
     content_type: ContentType,
-) -> Item {
+) -> Result<Item> {
     let rkey = rec.uri.rsplit('/').next().unwrap_or_default();
     let parsed = RecordValue::try_from_unknown(rec.value.clone()).ok();
     let (text, created_at) = match parsed {
@@ -272,18 +321,58 @@ fn record_to_item(
         None => (None, None),
     };
 
-    Item {
+    Ok(Item {
         content_type,
         created_at,
         text,
         engagement: Engagement::default(),
         scope_id: None,
-        media: Vec::new(),
+        media: record_media(&rec.value)?,
         item_ref: ItemRef {
             platform_id: rec.uri.clone(),
             token: Some(format!("{collection}:{rkey}")),
         },
+    })
+}
+
+/// Every blob a record owns, wherever it sits: images, a video and its captions,
+/// a link card's thumbnail, embed types added after this was written. A quoted
+/// post is only a reference, so its files are not picked up. An error here must
+/// end the scan: a post listed without its files would be deleted without them.
+fn record_media(record: &Unknown) -> Result<Vec<MediaRef>> {
+    let record = serde_json::to_value(record)
+        .map_err(|e| AdapterError::Platform(format!("unreadable record: {e}")))?;
+    let mut media = Vec::new();
+    collect_blobs(&record, &mut media);
+    Ok(media)
+}
+
+fn collect_blobs(value: &serde_json::Value, media: &mut Vec<MediaRef>) {
+    if let Ok(blob) = BlobRef::deserialize(value) {
+        media.push(blob_media(blob));
+        return;
     }
+    match value {
+        serde_json::Value::Object(fields) => {
+            fields.values().for_each(|field| collect_blobs(field, media));
+        }
+        serde_json::Value::Array(values) => {
+            values.iter().for_each(|value| collect_blobs(value, media));
+        }
+        _ => {}
+    }
+}
+
+/// `MediaRef.url` holds the blob's CID. Records from before blobs were typed state
+/// no size.
+fn blob_media(blob: BlobRef) -> MediaRef {
+    let (cid, mime, size) = match blob {
+        BlobRef::Typed(TypedBlobRef::Blob(blob)) => {
+            (blob.r#ref.0.to_string(), blob.mime_type, Some(blob.size as u64))
+        }
+        BlobRef::Untyped(blob) => (blob.cid, blob.mime_type, None),
+    };
+    MediaRef { url: cid, mime: Some(mime), file_name: None, size }
 }
 
 /// App-password auth (tracer). Debt: replace with DPoP OAuth before ship.
@@ -362,6 +451,10 @@ impl AuthProvider for BlueskyAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use atrium_api::agent::Configure;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn adapter() -> BlueskyAdapter {
         BlueskyAdapter::new(Arc::new(Egress::new(std::iter::empty::<String>())), "bsky.social")
@@ -372,6 +465,212 @@ mod tests {
         let a = adapter();
         let hosts: Vec<_> = a.descriptor().endpoints.iter().map(|e| e.host.as_str()).collect();
         assert!(hosts.contains(&"bsky.social"));
+    }
+
+    const IMAGE_ONE: &str = "bafkreifyopgoazxlalw3rdmlxmdkfnj75f5rjwj3pl2d7chvyvyhfjqzaq";
+    const IMAGE_TWO: &str = "bafkreifhmhch3in53b7vsjkmpodmptqp7tdgvuhaalbpkjxk4i5coqdwdy";
+    const VIDEO: &str = "bafkreiamvmojmf2aj6xswjhcehqytssziwat4fgt65tdiwyjzij3xyup7q";
+    const CAPTIONS: &str = "bafkreig4wpxo2dzlsen3mfpuob6d7jwxovre3dzmh5gmm2jev656pfdcgq";
+    const THUMB: &str = "bafkreiaf53wc24eek2knhoujvwpbynfwwtmamj24hrr3qqsbuqfoiwi4uq";
+    const LEGACY: &str = "bafkreiget7vhijp2p6djtcl2s7avtrtjajt5sab3w6gfh6x2r7avyms5qq";
+
+    fn blob(cid: &str, mime: &str, size: u64) -> serde_json::Value {
+        json!({ "$type": "blob", "ref": { "$link": cid }, "mimeType": mime, "size": size })
+    }
+
+    /// Media of a post whose record holds `embed`, as `list_records` returns it.
+    fn media_of(embed: serde_json::Value) -> Vec<MediaRef> {
+        let record = serde_json::from_value(json!({
+            "uri": "at://did:plc:test/app.bsky.feed.post/1",
+            "cid": IMAGE_ONE,
+            "value": {
+                "$type": "app.bsky.feed.post",
+                "text": "hello",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "embed": embed,
+            },
+        }))
+        .unwrap();
+        record_to_item(&record, COLLECTION_POST, ContentType::Post).unwrap().media
+    }
+
+    fn media(cid: &str, mime: &str, size: Option<u64>) -> MediaRef {
+        MediaRef { url: cid.into(), mime: Some(mime.into()), file_name: None, size }
+    }
+
+    #[test]
+    fn a_post_lists_its_images() {
+        let found = media_of(json!({
+            "$type": "app.bsky.embed.images",
+            "images": [
+                { "alt": "one", "image": blob(IMAGE_ONE, "image/jpeg", 100) },
+                { "alt": "two", "image": blob(IMAGE_TWO, "image/png", 200) },
+            ],
+        }));
+        assert_eq!(
+            found,
+            [
+                media(IMAGE_ONE, "image/jpeg", Some(100)),
+                media(IMAGE_TWO, "image/png", Some(200)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_post_lists_its_video_and_captions() {
+        let found = media_of(json!({
+            "$type": "app.bsky.embed.video",
+            "video": blob(VIDEO, "video/mp4", 300),
+            "captions": [{ "lang": "en", "file": blob(CAPTIONS, "text/vtt", 40) }],
+        }));
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&media(VIDEO, "video/mp4", Some(300))));
+        assert!(found.contains(&media(CAPTIONS, "text/vtt", Some(40))));
+    }
+
+    #[test]
+    fn a_quote_post_lists_its_own_media_but_not_the_quoted_post() {
+        let found = media_of(json!({
+            "$type": "app.bsky.embed.recordWithMedia",
+            "record": {
+                "$type": "app.bsky.embed.record",
+                "record": { "uri": "at://did:plc:other/app.bsky.feed.post/2", "cid": IMAGE_TWO },
+            },
+            "media": {
+                "$type": "app.bsky.embed.images",
+                "images": [{ "alt": "", "image": blob(IMAGE_ONE, "image/jpeg", 100) }],
+            },
+        }));
+        assert_eq!(found, [media(IMAGE_ONE, "image/jpeg", Some(100))]);
+    }
+
+    #[test]
+    fn a_link_card_lists_its_thumbnail() {
+        let found = media_of(json!({
+            "$type": "app.bsky.embed.external",
+            "external": {
+                "uri": "https://example.com",
+                "title": "t",
+                "description": "d",
+                "thumb": blob(THUMB, "image/webp", 50),
+            },
+        }));
+        assert_eq!(found, [media(THUMB, "image/webp", Some(50))]);
+    }
+
+    #[test]
+    fn a_blob_in_an_old_untyped_record_has_no_size() {
+        let found = media_of(json!({
+            "$type": "app.bsky.embed.images",
+            "images": [{ "alt": "", "image": { "cid": LEGACY, "mimeType": "image/jpeg" } }],
+        }));
+        assert_eq!(found, [media(LEGACY, "image/jpeg", None)]);
+    }
+
+    #[test]
+    fn an_embed_type_nobody_knows_yet_still_gives_up_its_files() {
+        let found = media_of(json!({
+            "$type": "app.bsky.embed.somethingNew",
+            "gallery": { "cover": blob(IMAGE_ONE, "image/avif", 70) },
+        }));
+        assert_eq!(found, [media(IMAGE_ONE, "image/avif", Some(70))]);
+    }
+
+    #[test]
+    fn a_quote_without_media_lists_nothing() {
+        let found = media_of(json!({
+            "$type": "app.bsky.embed.record",
+            "record": { "uri": "at://did:plc:other/app.bsky.feed.post/2", "cid": IMAGE_TWO },
+        }));
+        assert!(found.is_empty());
+    }
+
+    const POST: &str = "at://did:plc:test/app.bsky.feed.post/1";
+
+    fn post_ref() -> ItemRef {
+        ItemRef { platform_id: POST.into(), token: Some("app.bsky.feed.post:1".into()) }
+    }
+
+    /// An adapter signed in to `did:plc:test` on a fake PDS answering getBlob with `reply`.
+    async fn adapter_on_pds(reply: ResponseTemplate) -> (BlueskyAdapter, MockServer) {
+        let pds = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/xrpc/com.atproto.sync.getBlob"))
+            .and(query_param("did", "did:plc:test"))
+            .and(query_param("cid", IMAGE_ONE))
+            .respond_with(reply)
+            .mount(&pds)
+            .await;
+        let mut a = adapter();
+        a.agent.configure_endpoint(pds.uri());
+        a.did = Some("did:plc:test".parse().unwrap());
+        (a, pds)
+    }
+
+    #[tokio::test]
+    async fn a_fetched_blob_is_on_disk_in_full() {
+        let bytes = b"\xff\xd8 jpeg bytes";
+        let reply = ResponseTemplate::new(200).set_body_raw(bytes.to_vec(), "image/jpeg");
+        let (a, _pds) = adapter_on_pds(reply).await;
+
+        let file = a
+            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(bytes.len() as u64)))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&file.path).unwrap(), bytes);
+        a.release_media(&file).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_released_blob_is_gone_from_disk() {
+        let reply = ResponseTemplate::new(200).set_body_raw(b"bytes".to_vec(), "image/jpeg");
+        let (a, _pds) = adapter_on_pds(reply).await;
+        let file = a
+            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(5)))
+            .await
+            .unwrap();
+
+        a.release_media(&file).await.unwrap();
+
+        assert!(!file.path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_short_download_is_an_error() {
+        let reply = ResponseTemplate::new(200).set_body_raw(b"cut".to_vec(), "image/jpeg");
+        let (a, _pds) = adapter_on_pds(reply).await;
+
+        let error = a
+            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(100)))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_blob_the_pds_lost_does_not_read_as_a_deleted_post() {
+        let (a, _pds) = adapter_on_pds(ResponseTemplate::new(404)).await;
+
+        let error = a
+            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(5)))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_download_says_so() {
+        let (a, _pds) = adapter_on_pds(ResponseTemplate::new(429)).await;
+
+        let error = a
+            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(5)))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, AdapterError::RateLimited { .. }), "{error}");
     }
 
     #[tokio::test]
