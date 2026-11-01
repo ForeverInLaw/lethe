@@ -3,6 +3,7 @@
 //! atrium entrypoints:
 //! - auth   : `AtpAgent::login` (app-password `com.atproto.server.createSession`)
 //! - list   : `com.atproto.repo.list_records` (paginated by cursor) for enumerate
+//! - fetch  : `com.atproto.sync.get_blob` for a post's files, whole and in memory
 //! - delete : `com.atproto.repo.delete_record` (idempotent; "ensure absent")
 //!
 //! The reqwest client comes from `lethe_net::Egress` so all traffic is on the
@@ -15,7 +16,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::agent::atp_agent::{AtpAgent, AtpSession};
-use atrium_api::types::string::{AtIdentifier, Did, Nsid, RecordKey};
+use atrium_api::types::string::{AtIdentifier, Cid, Did, Nsid, RecordKey};
 use atrium_api::types::{BlobRef, TryFromUnknown, TypedBlobRef, Unknown};
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use lethe_adapter::{
@@ -26,6 +27,7 @@ use lethe_adapter::{
 };
 use lethe_net::Egress;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -115,7 +117,7 @@ impl BlueskyAdapter {
         Self { agent: Arc::new(build_agent(&egress)), descriptor, did: None }
     }
 
-    /// Restore a stored session so `enumerate`/`delete` act as the account.
+    /// Restore a stored session so `enumerate`/`fetch_media`/`delete` act as the account.
     /// Called once, before the adapter is handed to the pipeline.
     pub async fn authenticate(&mut self, cred: &Credential) -> Result<()> {
         let session: AtpSession = serde_json::from_str(&cred.secret.0)
@@ -214,11 +216,12 @@ impl PlatformAdapter for BlueskyAdapter {
     }
 
     async fn fetch_media(&self, _item: &ItemRef, media: &MediaRef) -> Result<FetchedMedia> {
-        let cid = media
+        let cid: Cid = media
             .url
             .parse()
             .map_err(|e| AdapterError::Platform(format!("bad blob cid: {e}")))?;
         let did = self.did()?;
+        let expected = cid.clone();
         let params = atrium_api::com::atproto::sync::get_blob::ParametersData { cid, did };
         let bytes = self
             .agent
@@ -235,9 +238,9 @@ impl PlatformAdapter for BlueskyAdapter {
                 }
                 other => other,
             })?;
-        if media.size.is_some_and(|size| size != bytes.len() as u64) {
+        if !is_content_of(&bytes, &expected) {
             return Err(AdapterError::Platform(
-                "the file could not be downloaded in full".into(),
+                "the downloaded file does not match the post".into(),
             ));
         }
 
@@ -293,6 +296,14 @@ impl BlueskyAdapter {
     }
 }
 
+/// A blob's CID is the SHA-256 of its bytes, so a post is only deleted once the
+/// backup holds exactly what it referenced.
+fn is_content_of(bytes: &[u8], cid: &Cid) -> bool {
+    const SHA2_256: u64 = 0x12;
+    let hash = cid.as_ref().hash();
+    hash.code() == SHA2_256 && hash.digest() == Sha256::digest(bytes).as_slice()
+}
+
 fn io_error(error: std::io::Error) -> AdapterError {
     AdapterError::Platform(format!("downloaded file: {error}"))
 }
@@ -337,8 +348,8 @@ fn record_to_item(
 
 /// Every blob a record owns, wherever it sits: images, a video and its captions,
 /// a link card's thumbnail, embed types added after this was written. A quoted
-/// post is only a reference, so its files are not picked up. An error here must
-/// end the scan: a post listed without its files would be deleted without them.
+/// post is only a reference, so its files are not picked up. A post listed without
+/// its files would be deleted without them, so failing to read a record ends the scan.
 fn record_media(record: &Unknown) -> Result<Vec<MediaRef>> {
     let record = serde_json::to_value(record)
         .map_err(|e| AdapterError::Platform(format!("unreadable record: {e}")))?;
@@ -350,6 +361,12 @@ fn record_media(record: &Unknown) -> Result<Vec<MediaRef>> {
 fn collect_blobs(value: &serde_json::Value, media: &mut Vec<MediaRef>) {
     if let Ok(blob) = BlobRef::deserialize(value) {
         media.push(blob_media(blob));
+        return;
+    }
+    // A blob we cannot read still counts: its reference never parses as a CID, so
+    // `fetch_media` fails and the post stays where it is.
+    if value.get("$type").and_then(serde_json::Value::as_str) == Some("blob") {
+        media.push(MediaRef { url: value.to_string(), mime: None, file_name: None, size: None });
         return;
     }
     match value {
@@ -467,6 +484,7 @@ mod tests {
         assert!(hosts.contains(&"bsky.social"));
     }
 
+    const POST: &str = "at://did:plc:test/app.bsky.feed.post/1";
     const IMAGE_ONE: &str = "bafkreifyopgoazxlalw3rdmlxmdkfnj75f5rjwj3pl2d7chvyvyhfjqzaq";
     const IMAGE_TWO: &str = "bafkreifhmhch3in53b7vsjkmpodmptqp7tdgvuhaalbpkjxk4i5coqdwdy";
     const VIDEO: &str = "bafkreiamvmojmf2aj6xswjhcehqytssziwat4fgt65tdiwyjzij3xyup7q";
@@ -481,7 +499,7 @@ mod tests {
     /// Media of a post whose record holds `embed`, as `list_records` returns it.
     fn media_of(embed: serde_json::Value) -> Vec<MediaRef> {
         let record = serde_json::from_value(json!({
-            "uri": "at://did:plc:test/app.bsky.feed.post/1",
+            "uri": POST,
             "cid": IMAGE_ONE,
             "value": {
                 "$type": "app.bsky.feed.post",
@@ -585,8 +603,6 @@ mod tests {
         assert!(found.is_empty());
     }
 
-    const POST: &str = "at://did:plc:test/app.bsky.feed.post/1";
-
     fn post_ref() -> ItemRef {
         ItemRef { platform_id: POST.into(), token: Some("app.bsky.feed.post:1".into()) }
     }
@@ -607,29 +623,29 @@ mod tests {
         (a, pds)
     }
 
+    /// `IMAGE_ONE` is the content address of exactly these bytes.
+    fn image_one_reply() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_raw(b"image one".to_vec(), "image/jpeg")
+    }
+
+    async fn fetch_image_one(a: &BlueskyAdapter) -> Result<FetchedMedia> {
+        a.fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(9))).await
+    }
+
     #[tokio::test]
     async fn a_fetched_blob_is_on_disk_in_full() {
-        let bytes = b"\xff\xd8 jpeg bytes";
-        let reply = ResponseTemplate::new(200).set_body_raw(bytes.to_vec(), "image/jpeg");
-        let (a, _pds) = adapter_on_pds(reply).await;
+        let (a, _pds) = adapter_on_pds(image_one_reply()).await;
 
-        let file = a
-            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(bytes.len() as u64)))
-            .await
-            .unwrap();
+        let file = fetch_image_one(&a).await.unwrap();
 
-        assert_eq!(std::fs::read(&file.path).unwrap(), bytes);
+        assert_eq!(std::fs::read(&file.path).unwrap(), b"image one");
         a.release_media(&file).await.unwrap();
     }
 
     #[tokio::test]
     async fn a_released_blob_is_gone_from_disk() {
-        let reply = ResponseTemplate::new(200).set_body_raw(b"bytes".to_vec(), "image/jpeg");
-        let (a, _pds) = adapter_on_pds(reply).await;
-        let file = a
-            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(5)))
-            .await
-            .unwrap();
+        let (a, _pds) = adapter_on_pds(image_one_reply()).await;
+        let file = fetch_image_one(&a).await.unwrap();
 
         a.release_media(&file).await.unwrap();
 
@@ -637,12 +653,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_short_download_is_an_error() {
-        let reply = ResponseTemplate::new(200).set_body_raw(b"cut".to_vec(), "image/jpeg");
+    async fn bytes_that_do_not_match_the_cid_are_an_error() {
+        // Same length as the real file, so a size check alone would pass it.
+        let reply = ResponseTemplate::new(200).set_body_raw(b"image two".to_vec(), "image/jpeg");
+        let (a, _pds) = adapter_on_pds(reply).await;
+
+        let error = fetch_image_one(&a).await.unwrap_err();
+
+        assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn wrong_bytes_are_caught_on_an_old_blob_with_no_size() {
+        let reply = ResponseTemplate::new(200).set_body_raw(b"an error page".to_vec(), "text/html");
         let (a, _pds) = adapter_on_pds(reply).await;
 
         let error = a
-            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(100)))
+            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", None))
             .await
             .unwrap_err();
 
@@ -653,10 +680,7 @@ mod tests {
     async fn a_blob_the_pds_lost_does_not_read_as_a_deleted_post() {
         let (a, _pds) = adapter_on_pds(ResponseTemplate::new(404)).await;
 
-        let error = a
-            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(5)))
-            .await
-            .unwrap_err();
+        let error = fetch_image_one(&a).await.unwrap_err();
 
         assert!(matches!(error, AdapterError::Platform(_)), "{error}");
     }
@@ -665,12 +689,32 @@ mod tests {
     async fn a_rate_limited_download_says_so() {
         let (a, _pds) = adapter_on_pds(ResponseTemplate::new(429)).await;
 
-        let error = a
-            .fetch_media(&post_ref(), &media(IMAGE_ONE, "image/jpeg", Some(5)))
-            .await
-            .unwrap_err();
+        let error = fetch_image_one(&a).await.unwrap_err();
 
         assert!(matches!(error, AdapterError::RateLimited { .. }), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_post_with_a_broken_blob_reference_can_never_be_archived() {
+        for broken in [
+            json!({ "$type": "blob", "ref": { "$link": IMAGE_ONE }, "mimeType": "image/jpeg" }),
+            json!({ "$type": "blob", "ref": { "$link": "not a cid" }, "mimeType": "image/jpeg", "size": 9 }),
+            json!({ "$type": "blob", "ref": { "$link": IMAGE_ONE }, "mimeType": "image/jpeg", "size": -1 }),
+        ] {
+            let found = media_of(json!({
+                "$type": "app.bsky.embed.images",
+                "images": [{ "alt": "", "image": broken }],
+            }));
+            assert_eq!(found.len(), 1, "a post must not read as having no files");
+
+            let error = adapter_on_pds(image_one_reply())
+                .await
+                .0
+                .fetch_media(&post_ref(), &found[0])
+                .await
+                .unwrap_err();
+            assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+        }
     }
 
     #[tokio::test]
