@@ -3,7 +3,7 @@
 //! The connection is keyed with `PRAGMA key` before any other statement.
 
 use lethe_adapter::{ContentType, ItemRef, MediaRef, Outcome};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 mod state;
 pub use state::{ItemState, RunState};
@@ -58,6 +58,34 @@ pub struct PreviewCounts {
     pub deleted: u64,
     pub skipped: u64,
     pub failed: u64,
+}
+
+/// One preview row as a UI lists it: what will go, or what was protected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemRow {
+    pub platform_id: String,
+    pub content_type: ContentType,
+    pub created_at_secs: Option<i64>,
+    pub text: Option<String>,
+    pub protected: bool,
+}
+
+/// Which preview rows to page through. Rows that already ran are never listed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ItemQuery {
+    pub protected_only: bool,
+    pub content_type: Option<ContentType>,
+    pub offset: u64,
+    pub limit: u64,
+}
+
+/// A signed receipt exactly as stored; `summary_json` is the signed payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredReceipt {
+    pub run_id: String,
+    pub summary_json: String,
+    pub public_key_hex: String,
+    pub signature_hex: String,
 }
 
 pub struct Store {
@@ -159,6 +187,71 @@ impl Store {
         Ok(c)
     }
 
+    /// Preview rows, newest first. Covers `pending` and `protected` only.
+    pub fn preview_items(&self, run_id: &str, query: &ItemQuery) -> Result<Vec<ItemRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT platform_id, content_type, created_at, text, state FROM items
+             WHERE run_id = ?1
+               AND state IN ('pending', 'protected')
+               AND (?2 = 0 OR state = 'protected')
+               AND (?3 IS NULL OR content_type = ?3)
+             ORDER BY created_at DESC, platform_id
+             LIMIT ?4 OFFSET ?5",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                run_id,
+                query.protected_only,
+                query.content_type.map(content_type_str),
+                query.limit as i64,
+                query.offset as i64,
+            ],
+            |r| {
+                Ok(ItemRow {
+                    platform_id: r.get(0)?,
+                    content_type: parse_content_type_column(r, 1)?,
+                    created_at_secs: r.get(2)?,
+                    text: r.get(3)?,
+                    protected: r.get::<_, String>(4)? == ItemState::Protected.as_str(),
+                })
+            },
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Pending rows per content type, for the preview breakdown.
+    pub fn pending_type_counts(&self, run_id: &str) -> Result<Vec<(ContentType, u64)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT content_type, COUNT(*) FROM items
+             WHERE run_id = ?1 AND state = 'pending'
+             GROUP BY content_type ORDER BY COUNT(*) DESC",
+        )?;
+        let rows = stmt.query_map(params![run_id], |r| {
+            Ok((parse_content_type_column(r, 0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    /// Move a preview row between `pending` and `protected`. Returns false when
+    /// the row is missing or already ran, so a finished outcome is never rewritten.
+    pub fn set_item_protected(
+        &self,
+        run_id: &str,
+        platform_id: &str,
+        protected: bool,
+    ) -> Result<bool> {
+        let (from, to) = if protected {
+            (ItemState::Pending, ItemState::Protected)
+        } else {
+            (ItemState::Protected, ItemState::Pending)
+        };
+        let changed = self.conn.execute(
+            "UPDATE items SET state = ?1 WHERE run_id = ?2 AND platform_id = ?3 AND state = ?4",
+            params![to.as_str(), run_id, platform_id, from.as_str()],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// Phase-2: claim up to `n` rows still `pending` for the next delete batch.
     pub fn claim_pending_batch(&self, run_id: &str, n: usize) -> Result<Vec<ItemRef>> {
         Ok(self
@@ -174,7 +267,6 @@ impl Store {
              WHERE run_id = ?1 AND state = 'pending' LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![run_id, n as i64], |r| {
-            let content_type: String = r.get(2)?;
             let media_json: String = r.get(5)?;
             let media = serde_json::from_str(&media_json).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
@@ -183,13 +275,7 @@ impl Store {
                     Box::new(e),
                 )
             })?;
-            let content_type = content_type_from_str(&content_type).map_err(|msg| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    2,
-                    rusqlite::types::Type::Text,
-                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
-                )
-            })?;
+            let content_type = parse_content_type_column(r, 2)?;
             Ok(PendingItem {
                 item_ref: ItemRef {
                     platform_id: r.get(0)?,
@@ -242,6 +328,28 @@ impl Store {
         Ok(())
     }
 
+    /// All stored receipts, most recently signed first.
+    pub fn receipts(&self) -> Result<Vec<StoredReceipt>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT run_id, summary_json, public_key_hex, signature_hex FROM receipts
+             ORDER BY rowid DESC",
+        )?;
+        let rows = stmt.query_map([], receipt_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+    pub fn receipt(&self, run_id: &str) -> Result<Option<StoredReceipt>> {
+        self.conn
+            .query_row(
+                "SELECT run_id, summary_json, public_key_hex, signature_hex FROM receipts
+                 WHERE run_id = ?1",
+                params![run_id],
+                receipt_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn log(&self, run_id: &str, at_secs: i64, level: &str, message: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO activity_log (run_id, at, level, message) VALUES (?1, ?2, ?3, ?4)",
@@ -270,6 +378,26 @@ fn content_type_from_str(ct: &str) -> std::result::Result<ContentType, String> {
         "dm" => Ok(ContentType::Dm),
         _ => Err(format!("unknown content type: {ct}")),
     }
+}
+
+fn parse_content_type_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<ContentType> {
+    let raw: String = row.get(index)?;
+    content_type_from_str(&raw).map_err(|msg| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, msg)),
+        )
+    })
+}
+
+fn receipt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReceipt> {
+    Ok(StoredReceipt {
+        run_id: row.get(0)?,
+        summary_json: row.get(1)?,
+        public_key_hex: row.get(2)?,
+        signature_hex: row.get(3)?,
+    })
 }
 
 fn migrate_content_columns(conn: &Connection) -> Result<()> {
@@ -306,6 +434,119 @@ mod tests {
             media: vec![MediaRef { url: format!("https://cdn/{id}"), mime: Some("text/plain".into()) }],
             state,
         }
+    }
+
+    fn run_with(items: &[ItemSnapshot]) -> Store {
+        let s = Store::open_in_memory("k").unwrap();
+        s.create_run(&NewRun {
+            run_id: "r".into(),
+            platform: "bluesky".into(),
+            account: "a".into(),
+            filter_json: "{}".into(),
+            started_secs: 0,
+        })
+        .unwrap();
+        s.snapshot_items("r", items).unwrap();
+        s
+    }
+
+    fn typed(id: &str, content_type: ContentType, at: i64, state: ItemState) -> ItemSnapshot {
+        ItemSnapshot { content_type, created_at_secs: Some(at), ..snap(id, state) }
+    }
+
+    fn ids(rows: &[ItemRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.platform_id.as_str()).collect()
+    }
+
+    #[test]
+    fn preview_items_page_newest_first_and_filter() {
+        let s = run_with(&[
+            typed("old", ContentType::Post, 1, ItemState::Pending),
+            typed("mid", ContentType::Reaction, 2, ItemState::Pending),
+            typed("new", ContentType::Post, 3, ItemState::Protected),
+        ]);
+        let all = ItemQuery { limit: 10, ..Default::default() };
+
+        assert_eq!(ids(&s.preview_items("r", &all).unwrap()), ["new", "mid", "old"]);
+        assert_eq!(
+            ids(&s.preview_items("r", &ItemQuery { offset: 1, limit: 1, ..all }).unwrap()),
+            ["mid"]
+        );
+        assert_eq!(
+            ids(&s
+                .preview_items("r", &ItemQuery { content_type: Some(ContentType::Reaction), ..all })
+                .unwrap()),
+            ["mid"]
+        );
+        let protected =
+            s.preview_items("r", &ItemQuery { protected_only: true, ..all }).unwrap();
+        assert_eq!(ids(&protected), ["new"]);
+        assert!(protected[0].protected);
+    }
+
+    #[test]
+    fn preview_items_hide_rows_that_already_ran() {
+        let mut s = run_with(&[snap("1", ItemState::Pending), snap("2", ItemState::Pending)]);
+        s.record_outcomes("r", &[("1".into(), Outcome::Deleted)]).unwrap();
+        let rows = s.preview_items("r", &ItemQuery { limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(ids(&rows), ["2"]);
+    }
+
+    #[test]
+    fn pending_type_counts_ignore_protected_rows() {
+        let s = run_with(&[
+            typed("a", ContentType::Post, 1, ItemState::Pending),
+            typed("b", ContentType::Post, 2, ItemState::Pending),
+            typed("c", ContentType::Reaction, 3, ItemState::Pending),
+            typed("d", ContentType::Reaction, 4, ItemState::Protected),
+        ]);
+        assert_eq!(
+            s.pending_type_counts("r").unwrap(),
+            [(ContentType::Post, 2), (ContentType::Reaction, 1)]
+        );
+    }
+
+    #[test]
+    fn protecting_a_row_keeps_it_from_the_delete_batch() {
+        let s = run_with(&[snap("1", ItemState::Pending), snap("2", ItemState::Pending)]);
+        assert!(s.set_item_protected("r", "1", true).unwrap());
+
+        let claimed = s.claim_pending_batch("r", 10).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].platform_id, "2");
+
+        assert!(s.set_item_protected("r", "1", false).unwrap());
+        assert_eq!(s.claim_pending_batch("r", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn protecting_never_rewrites_a_finished_outcome() {
+        let mut s = run_with(&[snap("1", ItemState::Pending)]);
+        s.record_outcomes("r", &[("1".into(), Outcome::Deleted)]).unwrap();
+        assert!(!s.set_item_protected("r", "1", true).unwrap());
+        assert!(!s.set_item_protected("r", "1", false).unwrap());
+        assert_eq!(s.preview_counts("r").unwrap().deleted, 1);
+    }
+
+    #[test]
+    fn receipts_read_back_newest_first() {
+        let s = run_with(&[]);
+        s.create_run(&NewRun {
+            run_id: "r2".into(),
+            platform: "bluesky".into(),
+            account: "a".into(),
+            filter_json: "{}".into(),
+            started_secs: 0,
+        })
+        .unwrap();
+        s.save_receipt("r", "{\"n\":1}", "pk", "sig1").unwrap();
+        s.save_receipt("r2", "{\"n\":2}", "pk", "sig2").unwrap();
+
+        let all = s.receipts().unwrap();
+        assert_eq!(all[0].run_id, "r2");
+        assert_eq!(all[1].signature_hex, "sig1");
+        assert_eq!(s.receipt("r").unwrap().unwrap().summary_json, "{\"n\":1}");
+        assert_eq!(s.receipt("missing").unwrap(), None);
     }
 
     #[test]
