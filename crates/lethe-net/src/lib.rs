@@ -107,27 +107,45 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
 
-    #[tokio::test]
-    async fn a_server_that_goes_silent_ends_in_an_error() {
+    /// Sends `reply` to the first connection, then goes silent without closing it.
+    async fn server_going_silent_after(reply: &'static [u8]) -> std::net::SocketAddr {
         let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
-        // Accepts the connection and never answers.
-        let _silent = tokio::spawn(async move {
-            let (socket, _) = server.accept().await.unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            socket.write_all(reply).await.unwrap();
             std::future::pending::<()>().await;
             drop(socket);
         });
+        addr
+    }
 
-        let egress = Egress::with_read_timeout(["127.0.0.1".to_owned()], Duration::from_millis(100));
-        let request = egress
-            .client()
-            .get(format!("http://{addr}/"))
-            .build()
-            .unwrap();
+    fn impatient_egress() -> Egress {
+        Egress::with_read_timeout(["127.0.0.1".to_owned()], Duration::from_millis(100))
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_ends_in_an_error() {
+        let addr = server_going_silent_after(b"").await;
+        let egress = impatient_egress();
+        let request = egress.client().get(format!("http://{addr}/")).build().unwrap();
 
         let outcome = tokio::time::timeout(Duration::from_secs(5), egress.execute(request)).await;
 
         assert!(outcome.expect("the request must not hang").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_download_that_stalls_halfway_ends_in_an_error() {
+        let addr = server_going_silent_after(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc").await;
+        let egress = impatient_egress();
+        let request = egress.client().get(format!("http://{addr}/")).build().unwrap();
+        let response = egress.execute(request).await.unwrap();
+
+        let body = tokio::time::timeout(Duration::from_secs(5), response.bytes()).await;
+
+        assert!(body.expect("the download must not hang").is_err());
     }
 }
