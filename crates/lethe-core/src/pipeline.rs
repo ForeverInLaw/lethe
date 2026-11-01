@@ -182,12 +182,10 @@ pub async fn execute(
                 deletable.push(item);
                 continue;
             };
-            if !keep_running(&control).await {
-                return abort(writer);
-            }
 
-            match archive_item(adapter.as_ref(), w, item).await? {
-                Ok(()) => {
+            match archive_item(adapter.as_ref(), w, item, &control).await? {
+                ArchiveResult::Stopped => return abort(writer),
+                ArchiveResult::Archived => {
                     archived.insert(platform_id.clone());
                     deletable.push(item);
                     if !item.media.is_empty() {
@@ -199,15 +197,15 @@ pub async fn execute(
                     }
                 }
                 // Not archived, so not deleted: the item stays pending for the next claim.
-                Err(AdapterError::RateLimited { retry_after_secs: secs }) => {
+                ArchiveResult::FetchFailed(AdapterError::RateLimited { retry_after_secs: secs }) => {
                     retry_after_secs = retry_after_secs.max(Some(secs));
                 }
-                Err(AdapterError::NotFound) => {
+                ArchiveResult::FetchFailed(AdapterError::NotFound) => {
                     outcome.skipped += 1;
                     let reason = "already deleted".to_string();
                     records.push((platform_id.clone(), Outcome::Skipped { reason }));
                 }
-                Err(error) => {
+                ArchiveResult::FetchFailed(error) => {
                     outcome.failed += 1;
                     let retryable = matches!(error, AdapterError::Transport(_));
                     let reason = format!("not backed up, so not deleted: {error}");
@@ -217,6 +215,10 @@ pub async fn execute(
         }
 
         if !deletable.is_empty() {
+            // Downloads can take long enough for a stop to arrive after the last gate.
+            if !keep_running(&control).await {
+                return abort(writer);
+            }
             if let Some(w) = writer.as_ref() {
                 w.sync()?;
             }
@@ -289,29 +291,41 @@ fn abort(writer: Option<ArchiveWriter>) -> Result<RunOutcome> {
     Err(EngineError::Aborted)
 }
 
-/// Downloads an item's files and archives them with its record. The outer error
-/// means the archive itself failed and the run must end; the inner one means a
-/// file could not be fetched, nothing was written and the item must not be deleted.
+enum ArchiveResult {
+    Archived,
+    /// The run was stopped before all of the item's files were fetched.
+    Stopped,
+    FetchFailed(AdapterError),
+}
+
+/// Downloads an item's files and archives them with its record. Unless the result
+/// is `Archived`, nothing was written and the item must not be deleted. An error
+/// means the archive itself failed and the run must end.
 async fn archive_item(
     adapter: &dyn PlatformAdapter,
     writer: &mut ArchiveWriter,
     item: &PendingItem,
-) -> Result<std::result::Result<(), AdapterError>> {
+    control: &RunControl,
+) -> Result<ArchiveResult> {
     let mut files = Vec::with_capacity(item.media.len());
-    let mut fetch_error = None;
+    let mut result = ArchiveResult::Archived;
     for media in &item.media {
+        if !keep_running(control).await {
+            result = ArchiveResult::Stopped;
+            break;
+        }
         match adapter.fetch_media(&item.item_ref, media).await {
             Ok(file) => files.push(file),
             Err(error) => {
-                fetch_error = Some(error);
+                result = ArchiveResult::FetchFailed(error);
                 break;
             }
         }
     }
 
-    let written = match fetch_error {
-        Some(_) => Ok(()),
-        None => writer.write_item(item, &files),
+    let written = match result {
+        ArchiveResult::Archived => writer.write_item(item, &files),
+        _ => Ok(()),
     };
     for file in &files {
         if let Err(error) = adapter.release_media(file).await {
@@ -319,7 +333,7 @@ async fn archive_item(
         }
     }
     written?;
-    Ok(fetch_error.map_or(Ok(()), Err))
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -943,5 +957,43 @@ mod tests {
         assert_eq!(run.audit().items, 1);
         assert!(adapter.journal().iter().all(|entry| !entry.starts_with("delete")));
         assert_eq!(run.store.preview_counts("media").unwrap().pending, 2);
+    }
+
+    #[tokio::test]
+    async fn stopping_during_the_last_download_deletes_nothing() {
+        let control = RunControl::new();
+        let stop = control.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", 3)])],
+            move |_, _| {
+                stop.stop();
+                Ok(downloaded(b"abc"))
+            },
+        ));
+
+        let run = run_media(adapter.clone(), control).await;
+
+        assert!(matches!(run.outcome, Err(EngineError::Aborted)));
+        assert!(adapter.journal().iter().all(|entry| !entry.starts_with("delete")));
+        assert_eq!(run.store.preview_counts("media").unwrap().pending, 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_between_files_of_a_message_fetches_no_more_of_them() {
+        let control = RunControl::new();
+        let stop = control.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("album", &[("first", 3), ("second", 3)])],
+            move |_, _| {
+                stop.stop();
+                Ok(downloaded(b"abc"))
+            },
+        ));
+
+        let run = run_media(adapter.clone(), control).await;
+
+        assert!(matches!(run.outcome, Err(EngineError::Aborted)));
+        assert_eq!(adapter.journal(), ["fetch first", "release 1"]);
+        assert_eq!(run.audit().items, 0);
     }
 }
