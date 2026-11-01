@@ -12,7 +12,7 @@ use lethe_adapter::{EnumeratePlan, Item, MediaRef, Outcome, PlatformAdapter};
 use lethe_crypto::container::ContainerWriter;
 use lethe_crypto::receipt::{ReceiptSigner, RunSummary, SignedReceipt};
 use lethe_crypto::DataKey;
-use lethe_store::{ItemSnapshot, ItemState, PreviewCounts, Store};
+use lethe_store::{ItemSnapshot, ItemState, PreviewCounts, RunState, Store};
 
 use crate::filter::{FilterSpec, Predicate};
 use crate::scheduler::Scheduler;
@@ -162,7 +162,6 @@ pub async fn execute(
     backup: Option<BackupTarget>,
 ) -> Result<RunOutcome> {
     let policy = adapter.rate_policy();
-    let total = store.preview_counts(&req.run_id)?.pending;
     let mut outcome = RunOutcome::default();
 
     // Open the encrypted backup up front (FR-BAK-1, on-by-default): if a target
@@ -183,6 +182,11 @@ pub async fn execute(
         }
         _ => None,
     };
+
+    // From here on the preview is final: `set_item_protected` refuses, and every
+    // protection committed before this line is seen by the first claim.
+    store.set_run_state(&req.run_id, RunState::Executing)?;
+    let total = store.preview_counts(&req.run_id)?.pending;
 
     loop {
         if control.is_stopped() {
@@ -287,7 +291,7 @@ mod tests {
     };
     use lethe_crypto::container::ContainerReader;
     use lethe_crypto::receipt::{verify, ReceiptSigner, RunSummary};
-    use lethe_store::{NewRun, Store};
+    use lethe_store::{ItemQuery, NewRun, Store};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Adapter that enumerates N posts and reports every delete as success.
@@ -546,5 +550,53 @@ mod tests {
             }
         }
         assert!(saw_throttled, "rate-limit event must reach progress stream");
+    }
+
+    #[tokio::test]
+    async fn execute_keeps_protected_rows_and_locks_the_preview() {
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(FakeAdapter::with_items(2));
+        let mut store = Store::open_in_memory("test-key").unwrap();
+        let mut scheduler = Scheduler::new();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let req = RunRequest {
+            run_id: "lock".into(),
+            platform: "fake".into(),
+            account_id: "fake:a".into(),
+            account_label: "acc".into(),
+            plan: EnumeratePlan::default(),
+            filter: match_all_filter(),
+            backup: false,
+        };
+        store
+            .create_run(&NewRun {
+                run_id: req.run_id.clone(),
+                platform: req.platform.clone(),
+                account: req.account_label.clone(),
+                filter_json: "{}".into(),
+                started_secs: 0,
+            })
+            .unwrap();
+        snapshot(adapter.clone(), &store, &req, &tx).await.unwrap();
+
+        let query = ItemQuery { limit: 10, ..Default::default() };
+        let kept = store.preview_items(&req.run_id, &query).unwrap().remove(0).platform_id;
+        assert!(store.set_item_protected(&req.run_id, &kept, true).unwrap());
+
+        let outcome = execute(
+            adapter,
+            &mut store,
+            &mut scheduler,
+            &req,
+            RunControl::new(),
+            &tx,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert!(!store.set_item_protected(&req.run_id, &kept, false).unwrap());
+        assert_eq!(store.preview_counts(&req.run_id).unwrap().protected, 1);
     }
 }
