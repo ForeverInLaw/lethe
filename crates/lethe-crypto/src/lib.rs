@@ -1,11 +1,9 @@
 //! Archive encryption + signed receipts.
 //!
-//! Container layout (FR-BAK-2, open & documented):
-//! ```text
-//! <header: secretstream init header + magic + version>
-//! manifest.json   (encrypted, item index + metadata)
-//! media/<id>      (encrypted, one secretstream message per chunk)
-//! ```
+//! Container layout (FR-BAK-2, open & documented): a header (magic + version +
+//! secretstream init header) followed by encrypted chunks. What the chunks hold is
+//! documented in `lethe_core::archive`.
+//!
 //! Keys (envelope): a random data-key encrypts the stream; the data-key is
 //! wrapped by Argon2id(passphrase) for portability AND by the OS keychain for
 //! convenience (wrapping is done at the app layer; this crate handles the

@@ -50,6 +50,13 @@ pub struct NewRun {
     pub started_secs: i64,
 }
 
+/// Files still to be archived for a run, as far as Phase 1 knows their sizes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingMedia {
+    pub bytes: u64,
+    pub largest_bytes: u64,
+}
+
 /// Per-state counts — the dry-run preview projection.
 #[derive(Debug, Clone, Default)]
 pub struct PreviewCounts {
@@ -185,6 +192,21 @@ impl Store {
             }
         }
         Ok(c)
+    }
+
+    pub fn pending_media(&self, run_id: &str) -> Result<PendingMedia> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT COALESCE(SUM(json_extract(file.value, '$.size')), 0),
+                    COALESCE(MAX(json_extract(file.value, '$.size')), 0)
+             FROM items, json_each(items.media_json) AS file
+             WHERE items.run_id = ?1 AND items.state = 'pending'",
+        )?;
+        Ok(stmt.query_row(params![run_id], |r| {
+            Ok(PendingMedia {
+                bytes: r.get::<_, i64>(0)? as u64,
+                largest_bytes: r.get::<_, i64>(1)? as u64,
+            })
+        })?)
     }
 
     /// Preview rows, newest first. Covers `pending` and `protected` only.
@@ -450,6 +472,8 @@ mod tests {
             media: vec![MediaRef {
                 url: format!("https://cdn/{id}"),
                 mime: Some("text/plain".into()),
+                file_name: None,
+                size: None,
             }],
             state,
         }
@@ -675,5 +699,38 @@ mod tests {
 
         // Resume: nothing left to do (idempotent).
         assert!(s.claim_pending_batch("r", 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn pending_media_sizes_only_files_that_will_be_archived() {
+        let sized = |id: &str, state: ItemState, sizes: &[Option<u64>]| ItemSnapshot {
+            media: sizes
+                .iter()
+                .map(|size| MediaRef {
+                    url: format!("file-{id}"),
+                    mime: None,
+                    file_name: None,
+                    size: *size,
+                })
+                .collect(),
+            ..snap(id, state)
+        };
+        let s = run_with(&[
+            sized("a", ItemState::Pending, &[Some(100), Some(700)]),
+            sized("b", ItemState::Pending, &[None]),
+            sized("c", ItemState::Protected, &[Some(9_000)]),
+            sized("d", ItemState::Pending, &[]),
+        ]);
+
+        let media = s.pending_media("r").unwrap();
+
+        assert_eq!(media.bytes, 800);
+        assert_eq!(media.largest_bytes, 700);
+    }
+
+    #[test]
+    fn pending_media_is_empty_for_a_run_without_files() {
+        let s = run_with(&[]);
+        assert_eq!(s.pending_media("r").unwrap(), PendingMedia::default());
     }
 }

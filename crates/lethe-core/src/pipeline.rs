@@ -2,18 +2,18 @@
 //! (Phase 2) acts on exactly the rows still `pending`. dry-run == executed is
 //! structural: the preview IS the snapshot the executor reads.
 
-use std::fs::File;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use lethe_adapter::{EnumeratePlan, Item, MediaRef, Outcome, PlatformAdapter};
-use lethe_crypto::container::ContainerWriter;
+use lethe_adapter::{AdapterError, EnumeratePlan, Item, Outcome, PlatformAdapter};
 use lethe_crypto::receipt::{ReceiptSigner, RunSummary, SignedReceipt};
 use lethe_crypto::DataKey;
-use lethe_store::{ItemSnapshot, ItemState, PreviewCounts, RunState, Store};
+use lethe_store::{ItemSnapshot, ItemState, PendingItem, PreviewCounts, RunState, Store};
 
+use crate::archive::ArchiveWriter;
 use crate::filter::{FilterSpec, Predicate};
 use crate::scheduler::Scheduler;
 use crate::{EngineError, ProgressEvent, ProgressTx, Result, RunControl};
@@ -46,27 +46,6 @@ pub struct RunOutcome {
     pub deleted: u64,
     pub skipped: u64,
     pub failed: u64,
-}
-
-#[derive(serde::Serialize)]
-struct BackupManifest<'a> {
-    run_id: &'a str,
-    platform: &'a str,
-    account_label: &'a str,
-}
-
-#[derive(serde::Serialize)]
-struct BackupItem<'a> {
-    platform_id: &'a str,
-    token: Option<&'a str>,
-    content_type: &'a str,
-    created_at_secs: Option<i64>,
-    text: Option<&'a str>,
-    media: &'a [MediaRef],
-}
-
-fn to_json(value: &impl serde::Serialize) -> Result<Vec<u8>> {
-    serde_json::to_vec(value).map_err(|e| EngineError::Io(e.to_string()))
 }
 
 /// Sign the run summary and persist the receipt. Shared by the CLI and the
@@ -165,21 +144,10 @@ pub async fn execute(
     let mut outcome = RunOutcome::default();
 
     // Open the encrypted backup up front (FR-BAK-1, on-by-default): if a target
-    // is given and the run requests backup, every batch is archived BEFORE its
+    // is given and the run requests backup, every item is archived BEFORE its
     // delete, so an interrupted run never deletes anything it has not backed up.
     let mut writer = match (&backup, req.backup) {
-        (Some(target), true) => {
-            let file =
-                File::create(&target.path).map_err(|e| EngineError::Io(e.to_string()))?;
-            let mut w = ContainerWriter::create(file, &target.key)?;
-            let manifest = BackupManifest {
-                run_id: &req.run_id,
-                platform: &req.platform,
-                account_label: &req.account_label,
-            };
-            w.write_chunk(&to_json(&manifest)?)?;
-            Some(w)
-        }
+        (Some(target), true) => Some(ArchiveWriter::create(target, req)?),
         _ => None,
     };
 
@@ -187,14 +155,16 @@ pub async fn execute(
     // protection committed before this line is seen by the first claim.
     store.set_run_state(&req.run_id, RunState::Executing)?;
     let total = store.preview_counts(&req.run_id)?.pending;
+    let _ = progress.send(ProgressEvent::Deleting { deleted: 0, skipped: 0, failed: 0, total });
+
+    let media_total_bytes = store.pending_media(&req.run_id)?.bytes;
+    let mut media_done_bytes = 0;
+    // A rate-limited delete comes back in the next claim; its backup is already done.
+    let mut archived: HashSet<String> = HashSet::new();
 
     loop {
-        if control.is_stopped() {
-            return Err(EngineError::Aborted);
-        }
-        if control.is_paused() {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            continue;
+        if !keep_running(&control).await {
+            return abort(writer);
         }
 
         let batch = store.claim_pending_items(&req.run_id, DELETE_BATCH)?;
@@ -202,43 +172,77 @@ pub async fn execute(
             break;
         }
 
-        // Backup-before-delete. Phase 1 captured text + media refs; fetching
-        // large media bytes remains an adapter-level follow-up.
-        if let Some(w) = writer.as_mut() {
-            for item in &batch {
-                let record = BackupItem {
-                    platform_id: &item.item_ref.platform_id,
-                    token: item.item_ref.token.as_deref(),
-                    content_type: content_type_str(item.content_type),
-                    created_at_secs: item.created_at_secs,
-                    text: item.text.as_deref(),
-                    media: &item.media,
-                };
-                w.write_chunk(&to_json(&record)?)?;
+        let mut deletable = Vec::with_capacity(batch.len());
+        let mut records = Vec::new();
+        let mut retry_after_secs: Option<u64> = None;
+
+        for item in &batch {
+            let platform_id = &item.item_ref.platform_id;
+            let Some(w) = writer.as_mut().filter(|_| !archived.contains(platform_id)) else {
+                deletable.push(item);
+                continue;
+            };
+
+            match archive_item(adapter.as_ref(), w, item, &control).await? {
+                ArchiveResult::Stopped => return abort(writer),
+                ArchiveResult::Archived => {
+                    archived.insert(platform_id.clone());
+                    deletable.push(item);
+                    if !item.media.is_empty() {
+                        media_done_bytes += item.media.iter().filter_map(|media| media.size).sum::<u64>();
+                        let _ = progress.send(ProgressEvent::Archiving {
+                            done_bytes: media_done_bytes,
+                            total_bytes: media_total_bytes,
+                        });
+                    }
+                }
+                // Not archived, so not deleted: the item stays pending for the next claim.
+                ArchiveResult::FetchFailed(AdapterError::RateLimited { retry_after_secs: secs }) => {
+                    retry_after_secs = retry_after_secs.max(Some(secs));
+                }
+                ArchiveResult::FetchFailed(AdapterError::NotFound) => {
+                    outcome.skipped += 1;
+                    let reason = "already deleted".to_string();
+                    records.push((platform_id.clone(), Outcome::Skipped { reason }));
+                }
+                ArchiveResult::FetchFailed(error) => {
+                    outcome.failed += 1;
+                    let retryable = matches!(error, AdapterError::Transport(_));
+                    let reason = format!("not backed up, so not deleted: {error}");
+                    records.push((platform_id.clone(), Outcome::Failed { reason, retryable }));
+                }
             }
         }
 
-        // Rate gate (one token per delete call; adapter batches internally).
-        scheduler.bucket(&req.account_id, &policy).acquire().await;
-
-        let delete_refs: Vec<_> = batch.iter().map(|item| item.item_ref.clone()).collect();
-        let outcomes = adapter.delete(&delete_refs).await;
-
-        // Terminal outcomes are checkpointed. Rate-limited items stay pending
-        // and are retried after the scheduler applies the platform delay.
-        let mut records = Vec::with_capacity(outcomes.len());
-        let mut retry_after_secs: Option<u64> = None;
-        for (item, result) in batch.iter().zip(outcomes) {
-            match &result {
-                Outcome::Deleted => outcome.deleted += 1,
-                Outcome::Skipped { .. } => outcome.skipped += 1,
-                Outcome::Failed { .. } => outcome.failed += 1,
-                Outcome::RateLimited { retry_after_secs: secs } => {
-                    retry_after_secs = Some(retry_after_secs.map_or(*secs, |current| current.max(*secs)));
-                    continue;
-                }
+        if !deletable.is_empty() {
+            // Downloads can take long enough for a stop to arrive after the last gate.
+            if !keep_running(&control).await {
+                return abort(writer);
             }
-            records.push((item.item_ref.platform_id.clone(), result));
+            if let Some(w) = writer.as_ref() {
+                w.sync()?;
+            }
+
+            // Rate gate (one token per delete call; adapter batches internally).
+            scheduler.bucket(&req.account_id, &policy).acquire().await;
+
+            let delete_refs: Vec<_> = deletable.iter().map(|item| item.item_ref.clone()).collect();
+            let outcomes = adapter.delete(&delete_refs).await;
+
+            // Terminal outcomes are checkpointed. Rate-limited items stay pending
+            // and are retried after the scheduler applies the platform delay.
+            for (item, result) in deletable.iter().zip(outcomes) {
+                match &result {
+                    Outcome::Deleted => outcome.deleted += 1,
+                    Outcome::Skipped { .. } => outcome.skipped += 1,
+                    Outcome::Failed { .. } => outcome.failed += 1,
+                    Outcome::RateLimited { retry_after_secs: secs } => {
+                        retry_after_secs = retry_after_secs.max(Some(*secs));
+                        continue;
+                    }
+                }
+                records.push((item.item_ref.platform_id.clone(), result));
+            }
         }
         if !records.is_empty() {
             store.record_outcomes(&req.run_id, &records)?;
@@ -270,14 +274,66 @@ pub async fn execute(
     Ok(outcome)
 }
 
-fn content_type_str(ct: lethe_adapter::ContentType) -> &'static str {
-    match ct {
-        lethe_adapter::ContentType::Post => "post",
-        lethe_adapter::ContentType::Comment => "comment",
-        lethe_adapter::ContentType::Reaction => "reaction",
-        lethe_adapter::ContentType::Media => "media",
-        lethe_adapter::ContentType::Dm => "dm",
+/// Waits out a pause. False once the run has been stopped.
+async fn keep_running(control: &RunControl) -> bool {
+    while control.is_paused() && !control.is_stopped() {
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    !control.is_stopped()
+}
+
+/// Seals what was archived so far: a stopped run keeps a complete backup of
+/// everything it already deleted.
+fn abort(writer: Option<ArchiveWriter>) -> Result<RunOutcome> {
+    if let Some(writer) = writer {
+        writer.finish()?;
+    }
+    Err(EngineError::Aborted)
+}
+
+enum ArchiveResult {
+    Archived,
+    /// The run was stopped before all of the item's files were fetched.
+    Stopped,
+    FetchFailed(AdapterError),
+}
+
+/// Downloads an item's files and archives them with its record. Unless the result
+/// is `Archived`, nothing was written and the item must not be deleted. An error
+/// means the archive itself failed and the run must end.
+async fn archive_item(
+    adapter: &dyn PlatformAdapter,
+    writer: &mut ArchiveWriter,
+    item: &PendingItem,
+    control: &RunControl,
+) -> Result<ArchiveResult> {
+    let mut files = Vec::with_capacity(item.media.len());
+    let mut result = ArchiveResult::Archived;
+    for media in &item.media {
+        if !keep_running(control).await {
+            result = ArchiveResult::Stopped;
+            break;
+        }
+        match adapter.fetch_media(&item.item_ref, media).await {
+            Ok(file) => files.push(file),
+            Err(error) => {
+                result = ArchiveResult::FetchFailed(error);
+                break;
+            }
+        }
+    }
+
+    let written = match result {
+        ArchiveResult::Archived => writer.write_item(item, &files),
+        _ => Ok(()),
+    };
+    for file in &files {
+        if let Err(error) = adapter.release_media(file).await {
+            tracing::warn!(%error, "could not remove a downloaded media file");
+        }
+    }
+    written?;
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -289,7 +345,11 @@ mod tests {
         AdapterError, Capabilities, ContentType, Descriptor, Engagement, ItemRef, ItemStream,
         RatePolicy, RiskClass,
     };
+    use crate::archive::audit_archive;
+    use lethe_adapter::{FetchedMedia, MediaRef};
     use lethe_crypto::container::ContainerReader;
+    use std::fs::File;
+    use std::sync::Mutex;
     use lethe_crypto::receipt::{verify, ReceiptSigner, RunSummary};
     use lethe_store::{ItemQuery, NewRun, Store};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -334,10 +394,7 @@ mod tests {
                         text: Some(format!("post {i}")),
                         engagement: Engagement::default(),
                         scope_id: None,
-                        media: vec![MediaRef {
-                            url: format!("https://cdn.fake/{i}"),
-                            mime: Some("text/plain".into()),
-                        }],
+                        media: vec![],
                         item_ref: ItemRef {
                             platform_id: format!("at://fake/app.bsky.feed.post/{i}"),
                             token: Some(format!("app.bsky.feed.post:{i}")),
@@ -466,7 +523,6 @@ mod tests {
         assert_eq!(chunks, n + 1, "manifest + one record per deleted item");
         let first_item: serde_json::Value = serde_json::from_slice(&first_item.unwrap()).unwrap();
         assert_eq!(first_item["text"], "post 0");
-        assert_eq!(first_item["media"][0]["url"], "https://cdn.fake/0");
         std::fs::remove_file(&path).ok();
 
         // Re-running deletes nothing (idempotent: no rows left pending).
@@ -598,5 +654,346 @@ mod tests {
         assert_eq!(outcome, RunOutcome { deleted: 1, skipped: 0, failed: 0 });
         assert!(!store.set_item_protected(&req.run_id, &kept, false).unwrap());
         assert_eq!(store.preview_counts(&req.run_id).unwrap().protected, 1);
+    }
+
+    /// Adapter whose items carry files, with scripted fetches and a call journal.
+    struct MediaAdapter {
+        inner: FakeAdapter,
+        items: Vec<Item>,
+        fetch: Box<dyn Fn(&MediaRef, usize) -> std::result::Result<FetchedMedia, AdapterError> + Send + Sync>,
+        delete_rate_limits: AtomicUsize,
+        fetches: AtomicUsize,
+        journal: Mutex<Vec<String>>,
+    }
+
+    impl MediaAdapter {
+        fn new(
+            items: Vec<Item>,
+            fetch: impl Fn(&MediaRef, usize) -> std::result::Result<FetchedMedia, AdapterError> + Send + Sync + 'static,
+        ) -> Self {
+            Self {
+                inner: FakeAdapter::with_items(0),
+                items,
+                fetch: Box::new(fetch),
+                delete_rate_limits: AtomicUsize::new(0),
+                fetches: AtomicUsize::new(0),
+                journal: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn journal(&self) -> Vec<String> {
+            self.journal.lock().unwrap().clone()
+        }
+
+        fn note(&self, entry: String) {
+            self.journal.lock().unwrap().push(entry);
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for MediaAdapter {
+        fn descriptor(&self) -> &Descriptor {
+            self.inner.descriptor()
+        }
+
+        async fn enumerate(&self, _plan: &EnumeratePlan) -> std::result::Result<ItemStream, AdapterError> {
+            Ok(Box::pin(stream::iter(self.items.clone().into_iter().map(Ok))))
+        }
+
+        async fn delete(&self, items: &[ItemRef]) -> Vec<Outcome> {
+            if self.delete_rate_limits.load(Ordering::SeqCst) > 0 {
+                self.delete_rate_limits.fetch_sub(1, Ordering::SeqCst);
+                return items.iter().map(|_| Outcome::RateLimited { retry_after_secs: 0 }).collect();
+            }
+            items
+                .iter()
+                .map(|item| {
+                    self.note(format!("delete {}", item.platform_id));
+                    Outcome::Deleted
+                })
+                .collect()
+        }
+
+        async fn fetch_media(
+            &self,
+            _item: &ItemRef,
+            media: &MediaRef,
+        ) -> std::result::Result<FetchedMedia, AdapterError> {
+            self.note(format!("fetch {}", media.url));
+            (self.fetch)(media, self.fetches.fetch_add(1, Ordering::SeqCst))
+        }
+
+        async fn release_media(&self, file: &FetchedMedia) -> std::result::Result<(), AdapterError> {
+            self.note(format!("release {}", file.handle));
+            std::fs::remove_file(&file.path).ok();
+            Ok(())
+        }
+
+        fn rate_policy(&self) -> RatePolicy {
+            self.inner.rate_policy()
+        }
+    }
+
+    fn media_item(id: &str, files: &[(&str, u64)]) -> Item {
+        Item {
+            content_type: ContentType::Media,
+            created_at: None,
+            text: Some(format!("caption {id}")),
+            engagement: Engagement::default(),
+            scope_id: None,
+            media: files
+                .iter()
+                .map(|(url, size)| MediaRef {
+                    url: (*url).into(),
+                    mime: Some("image/jpeg".into()),
+                    file_name: Some(format!("{url}.jpg")),
+                    size: Some(*size),
+                })
+                .collect(),
+            item_ref: ItemRef { platform_id: id.into(), token: None },
+        }
+    }
+
+    /// Writes a downloaded file for an adapter to hand over.
+    fn downloaded(bytes: &[u8]) -> FetchedMedia {
+        let path = std::env::temp_dir().join(format!("lethe-media-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, bytes).unwrap();
+        FetchedMedia { path, handle: 1 }
+    }
+
+    struct MediaRun {
+        outcome: Result<RunOutcome>,
+        store: Store,
+        events: Vec<ProgressEvent>,
+        archive: PathBuf,
+    }
+
+    const ARCHIVE_KEY: DataKey = [5u8; 32];
+
+    async fn run_media(adapter: Arc<MediaAdapter>, control: RunControl) -> MediaRun {
+        let mut store = Store::open_in_memory("test-key").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let req = RunRequest {
+            run_id: "media".into(),
+            platform: "fake".into(),
+            account_id: "fake:a".into(),
+            account_label: "acc".into(),
+            plan: EnumeratePlan::default(),
+            filter: match_all_filter(),
+            backup: true,
+        };
+        store
+            .create_run(&NewRun {
+                run_id: req.run_id.clone(),
+                platform: req.platform.clone(),
+                account: req.account_label.clone(),
+                filter_json: "{}".into(),
+                started_secs: 0,
+            })
+            .unwrap();
+        let archive = std::env::temp_dir().join(format!("lethe-archive-{}", uuid::Uuid::new_v4()));
+        snapshot(adapter.clone(), &store, &req, &tx).await.unwrap();
+        let outcome = execute(
+            adapter,
+            &mut store,
+            &mut Scheduler::new(),
+            &req,
+            control,
+            &tx,
+            Some(BackupTarget { path: archive.clone(), key: ARCHIVE_KEY }),
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        MediaRun { outcome, store, events, archive }
+    }
+
+    impl Drop for MediaRun {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.archive).ok();
+        }
+    }
+
+    impl MediaRun {
+        fn audit(&self) -> crate::archive::ArchiveAudit {
+            audit_archive(File::open(&self.archive).unwrap(), &ARCHIVE_KEY).unwrap()
+        }
+
+        fn chunks(&self) -> Vec<Vec<u8>> {
+            let mut reader = ContainerReader::open(File::open(&self.archive).unwrap(), &ARCHIVE_KEY).unwrap();
+            let mut chunks = Vec::new();
+            while let Some(chunk) = reader.read_chunk().unwrap() {
+                chunks.push(chunk);
+            }
+            chunks
+        }
+    }
+
+    #[tokio::test]
+    async fn files_reach_the_archive_before_their_message_is_deleted() {
+        // Spans a chunk boundary, so the file has to be split and put back together.
+        let bytes: Vec<u8> = (0..1024 * 1024 + 300).map(|i| (i % 251) as u8).collect();
+        let source = bytes.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", bytes.len() as u64)])],
+            move |_, _| Ok(downloaded(&source)),
+        ));
+
+        let run = run_media(adapter.clone(), RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(adapter.journal(), ["fetch photo", "release 1", "delete m1"]);
+
+        let chunks = run.chunks();
+        let record: serde_json::Value = serde_json::from_slice(&chunks[1]).unwrap();
+        assert_eq!(record["text"], "caption m1");
+        assert_eq!(record["media"][0]["file_name"], "photo.jpg");
+        assert_eq!(record["media"][0]["archived_bytes"], bytes.len() as u64);
+        assert_eq!(record["media"][0]["chunks"], 2);
+        assert_eq!(chunks[2..].concat(), bytes);
+        assert_eq!(run.audit().media_files, 1);
+        assert!(run.events.iter().any(|event| matches!(
+            event,
+            ProgressEvent::Archiving { done_bytes, total_bytes } if *done_bytes == *total_bytes && *total_bytes == bytes.len() as u64
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_fetched_keeps_its_message() {
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("kept", &[("bad", 3)]), media_item("gone", &[("good", 3)])],
+            |media, _| match media.url.as_str() {
+                "bad" => Err(AdapterError::Platform("file expired".into())),
+                _ => Ok(downloaded(b"abc")),
+            },
+        ));
+
+        let run = run_media(adapter.clone(), RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 1 });
+        assert!(!adapter.journal().contains(&"delete kept".to_string()));
+        assert!(adapter.journal().contains(&"delete gone".to_string()));
+        assert_eq!(run.store.preview_counts("media").unwrap().failed, 1);
+        assert_eq!(run.audit().items, 1, "a message that stays has no entry in the backup");
+    }
+
+    #[tokio::test]
+    async fn a_later_file_failing_removes_the_earlier_download_and_writes_nothing() {
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("album", &[("first", 3), ("second", 3)])],
+            |media, _| match media.url.as_str() {
+                "first" => Ok(downloaded(b"abc")),
+                _ => Err(AdapterError::Platform("file expired".into())),
+            },
+        ));
+
+        let run = run_media(adapter.clone(), RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap().failed, 1);
+        assert_eq!(adapter.journal(), ["fetch first", "fetch second", "release 1"]);
+        assert_eq!(run.audit().items, 0);
+    }
+
+    #[tokio::test]
+    async fn a_message_gone_before_its_file_is_fetched_counts_as_skipped() {
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", 3)])],
+            |_, _| Err(AdapterError::NotFound),
+        ));
+
+        let run = run_media(adapter, RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 1, failed: 0 });
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_fetch_is_retried_without_losing_the_item() {
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", 3)])],
+            |_, call| match call {
+                0 => Err(AdapterError::RateLimited { retry_after_secs: 0 }),
+                _ => Ok(downloaded(b"abc")),
+            },
+        ));
+
+        let run = run_media(adapter, RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1 });
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_delete_does_not_archive_the_item_twice() {
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", 3)])],
+            |_, _| Ok(downloaded(b"abc")),
+        ));
+        adapter.delete_rate_limits.store(1, Ordering::SeqCst);
+
+        let run = run_media(adapter.clone(), RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1 });
+        assert_eq!(adapter.fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_between_downloads_leaves_a_sealed_archive() {
+        let control = RunControl::new();
+        let stop = control.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", 3)]), media_item("m2", &[("video", 3)])],
+            move |_, _| {
+                stop.stop();
+                Ok(downloaded(b"abc"))
+            },
+        ));
+
+        let run = run_media(adapter.clone(), control).await;
+
+        assert!(matches!(run.outcome, Err(EngineError::Aborted)));
+        assert_eq!(run.audit().items, 1);
+        assert!(adapter.journal().iter().all(|entry| !entry.starts_with("delete")));
+        assert_eq!(run.store.preview_counts("media").unwrap().pending, 2);
+    }
+
+    #[tokio::test]
+    async fn stopping_during_the_last_download_deletes_nothing() {
+        let control = RunControl::new();
+        let stop = control.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", 3)])],
+            move |_, _| {
+                stop.stop();
+                Ok(downloaded(b"abc"))
+            },
+        ));
+
+        let run = run_media(adapter.clone(), control).await;
+
+        assert!(matches!(run.outcome, Err(EngineError::Aborted)));
+        assert!(adapter.journal().iter().all(|entry| !entry.starts_with("delete")));
+        assert_eq!(run.store.preview_counts("media").unwrap().pending, 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_between_files_of_a_message_fetches_no_more_of_them() {
+        let control = RunControl::new();
+        let stop = control.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("album", &[("first", 3), ("second", 3)])],
+            move |_, _| {
+                stop.stop();
+                Ok(downloaded(b"abc"))
+            },
+        ));
+
+        let run = run_media(adapter.clone(), control).await;
+
+        assert!(matches!(run.outcome, Err(EngineError::Aborted)));
+        assert_eq!(adapter.journal(), ["fetch first", "release 1"]);
+        assert_eq!(run.audit().items, 0);
     }
 }

@@ -54,6 +54,10 @@ impl<W: Write> ContainerWriter<W> {
         Ok(Self { sink, stream })
     }
 
+    pub fn sink(&self) -> &W {
+        &self.sink
+    }
+
     pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
         // dryoc's `Bytes` bound is `Sized`, so the frame source must be owned.
         let msg = bytes.to_vec();
