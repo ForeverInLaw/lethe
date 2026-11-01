@@ -29,8 +29,8 @@ depend on `untrace`.**
 ## Status
 
 M1 scaffold with the Bluesky tracer live. Telegram has a narrow TDLib bridge for
-chat-scope discovery, own-message page enumeration, and message batch deletion
-behind feature gates:
+chat-scope discovery, own-message page enumeration, media file download, and
+message batch deletion behind feature gates:
 
 - default builds do not link native TDLib;
 - `tdlib-docs` is for `cargo check` against generated TDLib bindings;
@@ -41,9 +41,12 @@ Current verification baseline:
 - `cargo check --workspace`
 - `cargo check -p lethe-telegram --features tdlib-docs`
 - `cargo test --workspace`
+- `cargo test -p lethe-telegram --features tdlib-download`
 
-Telegram has passed one live run on a test group. It is not claimed complete: media
-does not reach the backup yet.
+Telegram has passed one live run on a test group. Message text, media captions and
+media files go into the backup before the delete; a message whose file cannot be
+fetched stays where it is. The media path has not had a live run yet, and polls,
+locations and contacts back up without their content.
 
 External contributions are not accepted yet: a CLA comes first.
 
