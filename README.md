@@ -43,10 +43,14 @@ Current verification baseline:
 - `cargo test --workspace`
 - `cargo test -p lethe-telegram --features tdlib-download`
 
-Telegram has passed one live run on a test group. Message text, media captions and
-media files go into the backup before the delete; a message whose file cannot be
-fetched stays where it is. The media path has not had a live run yet, and polls,
-locations and contacts back up without their content.
+Telegram has passed live runs on a test group, including one with media files.
+Message text, media captions and media files go into the backup before the delete; a
+message whose file cannot be fetched stays where it is. Polls, locations and contacts
+back up without their content.
+
+In the desktop app, a Bluesky post goes into the backup with its text and every file
+it owns: images, video, captions and link card thumbnails. A post whose file cannot be
+fetched stays where it is. This has not yet gone through a live cleanup.
 
 External contributions are not accepted yet: a CLA comes first.
 

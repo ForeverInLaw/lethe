@@ -7,9 +7,13 @@
 //! on any connection outside the allowlist).
 
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
+
+/// How long a response may stay silent. A long download keeps resetting it, while
+/// a stalled one fails instead of holding a run past its stop button.
+const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {
@@ -37,9 +41,14 @@ pub struct Egress {
 
 impl Egress {
     pub fn new(allow: impl IntoIterator<Item = String>) -> Self {
+        Self::with_read_timeout(allow, READ_TIMEOUT)
+    }
+
+    fn with_read_timeout(allow: impl IntoIterator<Item = String>, read_timeout: Duration) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(concat!("lethe/", env!("CARGO_PKG_VERSION")))
             .use_rustls_tls()
+            .read_timeout(read_timeout)
             .build()
             .expect("reqwest client");
         Self {
@@ -93,4 +102,50 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    /// Sends `reply` to the first connection, then goes silent without closing it.
+    async fn server_going_silent_after(reply: &'static [u8]) -> std::net::SocketAddr {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = server.accept().await.unwrap();
+            socket.write_all(reply).await.unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        addr
+    }
+
+    fn impatient_egress() -> Egress {
+        Egress::with_read_timeout(["127.0.0.1".to_owned()], Duration::from_millis(100))
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_ends_in_an_error() {
+        let addr = server_going_silent_after(b"").await;
+        let egress = impatient_egress();
+        let request = egress.client().get(format!("http://{addr}/")).build().unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), egress.execute(request)).await;
+
+        assert!(outcome.expect("the request must not hang").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_download_that_stalls_halfway_ends_in_an_error() {
+        let addr = server_going_silent_after(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nabc").await;
+        let egress = impatient_egress();
+        let request = egress.client().get(format!("http://{addr}/")).build().unwrap();
+        let response = egress.execute(request).await.unwrap();
+
+        let body = tokio::time::timeout(Duration::from_secs(5), response.bytes()).await;
+
+        assert!(body.expect("the download must not hang").is_err());
+    }
 }
