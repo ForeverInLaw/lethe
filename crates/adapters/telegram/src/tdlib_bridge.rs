@@ -7,6 +7,9 @@
 use lethe_adapter::AdapterError;
 use tdlib_rs::{enums, functions, types};
 
+const CHAT_LOAD_PAGE: i32 = 100;
+const MAX_CHATS: i32 = 100_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TdlibClientId(i32);
 
@@ -76,8 +79,31 @@ pub struct TelegramMessageRef {
     pub text: Option<String>,
 }
 
-pub async fn list_chat_ids(client_id: TdlibClientId, limit: i32) -> Result<Vec<i64>, AdapterError> {
-    let chats = functions::get_chats(Some(enums::ChatList::Main), limit, client_id.raw())
+/// One page of the user's own messages in a chat, newest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnMessagePage {
+    pub messages: Vec<TelegramMessageRef>,
+    /// Pass back as `from_message_id` for the next page; 0 means no more results.
+    pub next_from_message_id: i64,
+    /// Approximate total across all pages; -1 if TDLib does not know it.
+    pub total_count: i32,
+}
+
+/// Loads a chat list to the end, since `get_chats` only returns already loaded chats.
+async fn list_chat_ids(
+    client_id: TdlibClientId,
+    list: enums::ChatList,
+) -> Result<Vec<i64>, AdapterError> {
+    loop {
+        match functions::load_chats(Some(list.clone()), CHAT_LOAD_PAGE, client_id.raw()).await {
+            Ok(()) => {}
+            // TDLib answers 404 once the whole list is loaded.
+            Err(error) if error.code == 404 => break,
+            Err(error) => return Err(map_tdlib_error(error)),
+        }
+    }
+
+    let chats = functions::get_chats(Some(list), MAX_CHATS, client_id.raw())
         .await
         .map_err(map_tdlib_error)?;
 
@@ -85,11 +111,16 @@ pub async fn list_chat_ids(client_id: TdlibClientId, limit: i32) -> Result<Vec<i
     Ok(chats.chat_ids)
 }
 
+/// Every chat in the main list and the archive.
 pub async fn list_chat_scopes(
     client_id: TdlibClientId,
-    limit: i32,
 ) -> Result<Vec<TelegramChatScope>, AdapterError> {
-    let chat_ids = list_chat_ids(client_id, limit).await?;
+    let mut chat_ids = list_chat_ids(client_id, enums::ChatList::Main).await?;
+    for chat_id in list_chat_ids(client_id, enums::ChatList::Archive).await? {
+        if !chat_ids.contains(&chat_id) {
+            chat_ids.push(chat_id);
+        }
+    }
     let mut scopes = Vec::with_capacity(chat_ids.len());
 
     for chat_id in chat_ids {
@@ -103,32 +134,49 @@ pub async fn list_chat_scopes(
     Ok(scopes)
 }
 
-pub async fn list_own_message_page(
+/// Searches by sender, so a page holds only the user's messages regardless of how
+/// deep they sit in the history. Not supported by TDLib for secret chats.
+pub async fn search_own_messages(
     client_id: TdlibClientId,
     chat_id: i64,
     current_user_id: i64,
     from_message_id: i64,
     limit: i32,
-) -> Result<Vec<TelegramMessageRef>, AdapterError> {
-    let messages =
-        functions::get_chat_history(chat_id, from_message_id, 0, limit, false, client_id.raw())
-            .await
-            .map_err(map_tdlib_error)?;
+) -> Result<OwnMessagePage, AdapterError> {
+    let sender = enums::MessageSender::User(types::MessageSenderUser {
+        user_id: current_user_id,
+    });
+    let found = functions::search_chat_messages(
+        chat_id,
+        None,
+        String::new(),
+        Some(sender),
+        from_message_id,
+        0,
+        limit,
+        None,
+        client_id.raw(),
+    )
+    .await
+    .map_err(map_tdlib_error)?;
 
-    let enums::Messages::Messages(messages) = messages;
-    Ok(messages
-        .messages
-        .into_iter()
-        .flatten()
-        .filter(|message| is_from_user(message, current_user_id))
-        .map(|message| TelegramMessageRef {
-            chat_id: message.chat_id,
-            message_id: message.id,
-            sent_at_epoch_secs: message.date,
-            kind: classify_message_content(&message.content),
-            text: extract_message_text(&message.content),
-        })
-        .collect())
+    let enums::FoundChatMessages::FoundChatMessages(found) = found;
+    Ok(OwnMessagePage {
+        next_from_message_id: found.next_from_message_id,
+        total_count: found.total_count,
+        messages: found
+            .messages
+            .into_iter()
+            .filter(|message| is_from_user(message, current_user_id))
+            .map(|message| TelegramMessageRef {
+                chat_id: message.chat_id,
+                message_id: message.id,
+                sent_at_epoch_secs: message.date,
+                kind: classify_message_content(&message.content),
+                text: extract_message_text(&message.content),
+            })
+            .collect(),
+    })
 }
 
 pub async fn delete_message_batch(
