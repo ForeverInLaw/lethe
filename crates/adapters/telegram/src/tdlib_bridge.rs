@@ -202,20 +202,32 @@ pub async fn download_message_file(
         .find(|file| file.remote.unique_id == unique_id)
         .ok_or_else(|| AdapterError::Platform("the message no longer has this file".into()))?;
 
-    let enums::File::File(downloaded) =
-        functions::download_file(file.id, DOWNLOAD_PRIORITY, 0, 0, true, client_id.raw())
-            .await
-            .map_err(map_download_error)?;
-    let bytes_on_disk = std::fs::metadata(&downloaded.local.path).map_or(0, |meta| meta.len());
-    if !download_is_complete(&downloaded, bytes_on_disk) {
-        return Err(AdapterError::Platform(
-            "the file could not be downloaded".into(),
-        ));
+    let fetched = functions::download_file(file.id, DOWNLOAD_PRIORITY, 0, 0, true, client_id.raw())
+        .await
+        .map_err(map_download_error)
+        .and_then(|enums::File::File(downloaded)| {
+            let bytes_on_disk =
+                std::fs::metadata(&downloaded.local.path).map_or(0, |meta| meta.len());
+            if !download_is_complete(&downloaded, bytes_on_disk) {
+                return Err(AdapterError::Platform(
+                    "the file could not be downloaded".into(),
+                ));
+            }
+            Ok(FetchedMedia {
+                path: downloaded.local.path.into(),
+                handle: i64::from(downloaded.id),
+            })
+        });
+
+    // Core only releases what it receives, so a partial download is removed here.
+    if fetched.is_err() {
+        if let Err(error) = delete_downloaded_file(client_id, file.id).await {
+            return Err(AdapterError::Platform(format!(
+                "the file could not be downloaded, and its partial copy stayed on disk: {error}"
+            )));
+        }
     }
-    Ok(FetchedMedia {
-        path: downloaded.local.path.into(),
-        handle: i64::from(downloaded.id),
-    })
+    fetched
 }
 
 /// Removes a downloaded file from TDLib's files directory, which is not encrypted.
