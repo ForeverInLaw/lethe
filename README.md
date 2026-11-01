@@ -48,8 +48,10 @@ Message text, media captions and media files go into the backup before the delet
 message whose file cannot be fetched stays where it is. Polls, locations and contacts
 back up without their content.
 
-Bluesky posts back up as text only: their images and videos are deleted without
-reaching the backup.
+A Bluesky post goes into the backup with its text and every file it owns: images,
+video, captions and link card thumbnails. A post whose file cannot be fetched stays
+where it is. Files were checked by downloading them from a real server, but this has
+not yet gone through a live cleanup.
 
 External contributions are not accepted yet: a CLA comes first.
 
