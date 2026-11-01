@@ -216,7 +216,8 @@ impl Store {
                 })
             },
         )?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Pending rows per content type, for the preview breakdown.
@@ -229,7 +230,8 @@ impl Store {
         let rows = stmt.query_map(params![run_id], |r| {
             Ok((parse_content_type_column(r, 0)?, r.get::<_, i64>(1)? as u64))
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Move a preview row between `pending` and `protected`. Returns false when
@@ -287,7 +289,8 @@ impl Store {
                 media,
             })
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// Record batch outcomes in a single transaction (idempotent resume point).
@@ -335,7 +338,8 @@ impl Store {
              ORDER BY rowid DESC",
         )?;
         let rows = stmt.query_map([], receipt_from_row)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn receipt(&self, run_id: &str) -> Result<Option<StoredReceipt>> {
@@ -380,7 +384,10 @@ fn content_type_from_str(ct: &str) -> std::result::Result<ContentType, String> {
     }
 }
 
-fn parse_content_type_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<ContentType> {
+fn parse_content_type_column(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<ContentType> {
     let raw: String = row.get(index)?;
     content_type_from_str(&raw).map_err(|msg| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -405,7 +412,10 @@ fn migrate_content_columns(conn: &Connection) -> Result<()> {
         conn.execute("ALTER TABLE items ADD COLUMN text TEXT", [])?;
     }
     if !column_exists(conn, "items", "media_json")? {
-        conn.execute("ALTER TABLE items ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]'", [])?;
+        conn.execute(
+            "ALTER TABLE items ADD COLUMN media_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -427,11 +437,17 @@ mod tests {
 
     fn snap(id: &str, state: ItemState) -> ItemSnapshot {
         ItemSnapshot {
-            item_ref: ItemRef { platform_id: id.into(), token: None },
+            item_ref: ItemRef {
+                platform_id: id.into(),
+                token: None,
+            },
             content_type: ContentType::Post,
             created_at_secs: Some(1),
             text: Some(format!("text {id}")),
-            media: vec![MediaRef { url: format!("https://cdn/{id}"), mime: Some("text/plain".into()) }],
+            media: vec![MediaRef {
+                url: format!("https://cdn/{id}"),
+                mime: Some("text/plain".into()),
+            }],
             state,
         }
     }
@@ -451,7 +467,11 @@ mod tests {
     }
 
     fn typed(id: &str, content_type: ContentType, at: i64, state: ItemState) -> ItemSnapshot {
-        ItemSnapshot { content_type, created_at_secs: Some(at), ..snap(id, state) }
+        ItemSnapshot {
+            content_type,
+            created_at_secs: Some(at),
+            ..snap(id, state)
+        }
     }
 
     fn ids(rows: &[ItemRow]) -> Vec<&str> {
@@ -465,21 +485,49 @@ mod tests {
             typed("mid", ContentType::Reaction, 2, ItemState::Pending),
             typed("new", ContentType::Post, 3, ItemState::Protected),
         ]);
-        let all = ItemQuery { limit: 10, ..Default::default() };
+        let all = ItemQuery {
+            limit: 10,
+            ..Default::default()
+        };
 
-        assert_eq!(ids(&s.preview_items("r", &all).unwrap()), ["new", "mid", "old"]);
         assert_eq!(
-            ids(&s.preview_items("r", &ItemQuery { offset: 1, limit: 1, ..all }).unwrap()),
+            ids(&s.preview_items("r", &all).unwrap()),
+            ["new", "mid", "old"]
+        );
+        assert_eq!(
+            ids(&s
+                .preview_items(
+                    "r",
+                    &ItemQuery {
+                        offset: 1,
+                        limit: 1,
+                        ..all
+                    }
+                )
+                .unwrap()),
             ["mid"]
         );
         assert_eq!(
             ids(&s
-                .preview_items("r", &ItemQuery { content_type: Some(ContentType::Reaction), ..all })
+                .preview_items(
+                    "r",
+                    &ItemQuery {
+                        content_type: Some(ContentType::Reaction),
+                        ..all
+                    }
+                )
                 .unwrap()),
             ["mid"]
         );
-        let protected =
-            s.preview_items("r", &ItemQuery { protected_only: true, ..all }).unwrap();
+        let protected = s
+            .preview_items(
+                "r",
+                &ItemQuery {
+                    protected_only: true,
+                    ..all
+                },
+            )
+            .unwrap();
         assert_eq!(ids(&protected), ["new"]);
         assert!(protected[0].protected);
     }
@@ -487,8 +535,17 @@ mod tests {
     #[test]
     fn preview_items_hide_rows_that_already_ran() {
         let mut s = run_with(&[snap("1", ItemState::Pending), snap("2", ItemState::Pending)]);
-        s.record_outcomes("r", &[("1".into(), Outcome::Deleted)]).unwrap();
-        let rows = s.preview_items("r", &ItemQuery { limit: 10, ..Default::default() }).unwrap();
+        s.record_outcomes("r", &[("1".into(), Outcome::Deleted)])
+            .unwrap();
+        let rows = s
+            .preview_items(
+                "r",
+                &ItemQuery {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(ids(&rows), ["2"]);
     }
 
@@ -522,7 +579,8 @@ mod tests {
     #[test]
     fn protecting_never_rewrites_a_finished_outcome() {
         let mut s = run_with(&[snap("1", ItemState::Pending)]);
-        s.record_outcomes("r", &[("1".into(), Outcome::Deleted)]).unwrap();
+        s.record_outcomes("r", &[("1".into(), Outcome::Deleted)])
+            .unwrap();
         assert!(!s.set_item_protected("r", "1", true).unwrap());
         assert!(!s.set_item_protected("r", "1", false).unwrap());
         assert_eq!(s.preview_counts("r").unwrap().deleted, 1);
@@ -586,7 +644,10 @@ mod tests {
 
         s.record_outcomes(
             "r",
-            &[("1".into(), Outcome::Deleted), ("2".into(), Outcome::Deleted)],
+            &[
+                ("1".into(), Outcome::Deleted),
+                ("2".into(), Outcome::Deleted),
+            ],
         )
         .unwrap();
 
