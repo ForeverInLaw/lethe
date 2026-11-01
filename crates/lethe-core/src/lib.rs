@@ -1,5 +1,6 @@
 //! Lethe engine core.
 
+pub mod archive;
 pub mod filter;
 pub mod pipeline;
 pub mod scheduler;
@@ -33,6 +34,8 @@ pub type Result<T> = std::result::Result<T, EngineError>;
 pub enum ProgressEvent {
     Enumerating { seen: u64 },
     PreviewReady { pending: u64, protected: u64 },
+    /// Media files going into the backup, in expected bytes.
+    Archiving { done_bytes: u64, total_bytes: u64 },
     Deleting { deleted: u64, skipped: u64, failed: u64, total: u64 },
     Throttled { rate_per_sec: f64, wait_secs: u64 },
     Done { run_id: String },
