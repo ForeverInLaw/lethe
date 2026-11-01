@@ -75,8 +75,8 @@ pub struct ItemRow {
 pub struct ItemQuery {
     pub protected_only: bool,
     pub content_type: Option<ContentType>,
-    pub offset: u64,
-    pub limit: u64,
+    pub offset: u32,
+    pub limit: u32,
 }
 
 /// A signed receipt exactly as stored; `summary_json` is the signed payload.
@@ -203,8 +203,8 @@ impl Store {
                 run_id,
                 query.protected_only,
                 query.content_type.map(content_type_str),
-                query.limit as i64,
-                query.offset as i64,
+                i64::from(query.limit),
+                i64::from(query.offset),
             ],
             |r| {
                 Ok(ItemRow {
@@ -235,7 +235,8 @@ impl Store {
     }
 
     /// Move a preview row between `pending` and `protected`. Returns false when
-    /// the row is missing or already ran, so a finished outcome is never rewritten.
+    /// the row is missing or already ran, or once its run is executing: a batch may
+    /// already be on its way to the platform, so the choice could no longer hold.
     pub fn set_item_protected(
         &self,
         run_id: &str,
@@ -248,7 +249,9 @@ impl Store {
             (ItemState::Protected, ItemState::Pending)
         };
         let changed = self.conn.execute(
-            "UPDATE items SET state = ?1 WHERE run_id = ?2 AND platform_id = ?3 AND state = ?4",
+            "UPDATE items SET state = ?1
+             WHERE run_id = ?2 AND platform_id = ?3 AND state = ?4
+               AND NOT EXISTS (SELECT 1 FROM runs WHERE run_id = ?2 AND state = 'executing')",
             params![to.as_str(), run_id, platform_id, from.as_str()],
         )?;
         Ok(changed == 1)
@@ -584,6 +587,20 @@ mod tests {
         assert!(!s.set_item_protected("r", "1", true).unwrap());
         assert!(!s.set_item_protected("r", "1", false).unwrap());
         assert_eq!(s.preview_counts("r").unwrap().deleted, 1);
+    }
+
+    #[test]
+    fn protection_is_locked_once_the_run_executes() {
+        let s = run_with(&[
+            snap("1", ItemState::Pending),
+            snap("2", ItemState::Protected),
+        ]);
+        s.set_run_state("r", RunState::Executing).unwrap();
+
+        assert!(!s.set_item_protected("r", "1", true).unwrap());
+        assert!(!s.set_item_protected("r", "2", false).unwrap());
+        let counts = s.preview_counts("r").unwrap();
+        assert_eq!((counts.pending, counts.protected), (1, 1));
     }
 
     #[test]
