@@ -7,6 +7,7 @@
 //! No transport types (reqwest/http) appear in this crate's public API.
 
 use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -149,10 +150,24 @@ pub struct Engagement {
     pub views: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MediaRef {
+    /// Where the adapter finds the file: a URL or a platform file id.
     pub url: String,
     pub mime: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+    /// Expected size in bytes, for sizing the backup before the run starts.
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+/// A media file downloaded to local disk, ready to be archived.
+#[derive(Debug, Clone)]
+pub struct FetchedMedia {
+    pub path: PathBuf,
+    /// The adapter's own reference to the file, for `release_media`.
+    pub handle: i64,
 }
 
 /// Opaque handle the adapter needs to delete an item. `platform_id` is the
@@ -259,6 +274,19 @@ pub trait PlatformAdapter: Send + Sync {
             reason: "redact not supported by this adapter".into(),
             retryable: false,
         }
+    }
+
+    /// Downloads one of an item's files so core can archive it before the delete.
+    /// Core calls `release_media` once the file is archived or the attempt failed.
+    async fn fetch_media(&self, _item: &ItemRef, _media: &MediaRef) -> Result<FetchedMedia> {
+        Err(AdapterError::Unsupported(
+            "media backup is not supported by this adapter".into(),
+        ))
+    }
+
+    /// Removes the plaintext local copy made by `fetch_media`.
+    async fn release_media(&self, _file: &FetchedMedia) -> Result<()> {
+        Ok(())
     }
 
     fn rate_policy(&self) -> RatePolicy;
