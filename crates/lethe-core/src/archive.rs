@@ -11,7 +11,7 @@
 use std::fs::File;
 use std::io::Read;
 
-use lethe_adapter::{FetchedMedia, MediaRef};
+use lethe_adapter::{FetchedMedia, MediaRef, PlatformRecord};
 use lethe_crypto::container::{ContainerReader, ContainerWriter};
 use lethe_crypto::DataKey;
 use lethe_store::PendingItem;
@@ -37,6 +37,12 @@ struct ItemRecord<'a> {
     created_at_secs: Option<i64>,
     text: Option<&'a str>,
     media: Vec<MediaRecord<'a>>,
+    /// The item as the platform returned it. Older archives do not have it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    platform_record: Option<&'a PlatformRecord>,
+    /// What this entry lacks, for an item deleted with the person's consent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup_gap: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -93,6 +99,8 @@ impl ArchiveWriter {
                     chunks: size.div_ceil(MEDIA_CHUNK_BYTES as u64),
                 })
                 .collect(),
+            platform_record: item.platform_record.as_ref(),
+            backup_gap: item.backup_gap.as_deref(),
         };
         self.container.write_chunk(&to_json(&record)?)?;
         for (file, size) in files.iter().zip(sizes) {

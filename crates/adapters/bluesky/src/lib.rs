@@ -22,7 +22,7 @@ use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use lethe_adapter::{
     AdapterError, AuthProvider, Capabilities, Consent, ContentType, Credential, Descriptor,
     Engagement, EnumeratePlan, FetchedMedia, Item, ItemRef, ItemStream, MediaRef, Outcome,
-    PlatformAdapter, PushdownDim,
+    PlatformAdapter, PlatformRecord, PushdownDim,
     RatePolicy, Result, RiskClass, SecretBlob,
 };
 use lethe_net::Egress;
@@ -332,13 +332,18 @@ fn record_to_item(
         None => (None, None),
     };
 
+    let files = record_files(&rec.value)?;
     Ok(Item {
         content_type,
         created_at,
         text,
         engagement: Engagement::default(),
         scope_id: None,
-        media: record_media(&rec.value)?,
+        media: files.media,
+        platform_record: Some(PlatformRecord::capture(rec)?),
+        backup_gap: files
+            .has_unreadable_blob
+            .then(|| "a file in this post has a reference that cannot be read".to_owned()),
         item_ref: ItemRef {
             platform_id: rec.uri.clone(),
             token: Some(format!("{collection}:{rkey}")),
@@ -346,35 +351,39 @@ fn record_to_item(
     })
 }
 
+#[derive(Default)]
+struct RecordFiles {
+    media: Vec<MediaRef>,
+    has_unreadable_blob: bool,
+}
+
 /// Every blob a record owns, wherever it sits: images, a video and its captions,
 /// a link card's thumbnail, embed types added after this was written. A quoted
 /// post is only a reference, so its files are not picked up. A post listed without
 /// its files would be deleted without them, so failing to read a record ends the scan.
-fn record_media(record: &Unknown) -> Result<Vec<MediaRef>> {
+fn record_files(record: &Unknown) -> Result<RecordFiles> {
     let record = serde_json::to_value(record)
         .map_err(|e| AdapterError::Platform(format!("unreadable record: {e}")))?;
-    let mut media = Vec::new();
-    collect_blobs(&record, &mut media);
-    Ok(media)
+    let mut files = RecordFiles::default();
+    collect_blobs(&record, &mut files);
+    Ok(files)
 }
 
-fn collect_blobs(value: &serde_json::Value, media: &mut Vec<MediaRef>) {
+fn collect_blobs(value: &serde_json::Value, files: &mut RecordFiles) {
     if let Ok(blob) = BlobRef::deserialize(value) {
-        media.push(blob_media(blob));
+        files.media.push(blob_media(blob));
         return;
     }
-    // A blob we cannot read still counts: its reference never parses as a CID, so
-    // `fetch_media` fails and the post stays where it is.
     if value.get("$type").and_then(serde_json::Value::as_str) == Some("blob") {
-        media.push(MediaRef { url: value.to_string(), mime: None, file_name: None, size: None });
+        files.has_unreadable_blob = true;
         return;
     }
     match value {
         serde_json::Value::Object(fields) => {
-            fields.values().for_each(|field| collect_blobs(field, media));
+            fields.values().for_each(|field| collect_blobs(field, files));
         }
         serde_json::Value::Array(values) => {
-            values.iter().for_each(|value| collect_blobs(value, media));
+            values.iter().for_each(|value| collect_blobs(value, files));
         }
         _ => {}
     }
@@ -498,6 +507,10 @@ mod tests {
 
     /// Media of a post whose record holds `embed`, as `list_records` returns it.
     fn media_of(embed: serde_json::Value) -> Vec<MediaRef> {
+        item_of(embed).media
+    }
+
+    fn item_of(embed: serde_json::Value) -> Item {
         let record = serde_json::from_value(json!({
             "uri": POST,
             "cid": IMAGE_ONE,
@@ -509,7 +522,7 @@ mod tests {
             },
         }))
         .unwrap();
-        record_to_item(&record, COLLECTION_POST, ContentType::Post).unwrap().media
+        record_to_item(&record, COLLECTION_POST, ContentType::Post).unwrap()
     }
 
     fn media(cid: &str, mime: &str, size: Option<u64>) -> MediaRef {
@@ -694,27 +707,94 @@ mod tests {
         assert!(matches!(error, AdapterError::RateLimited { .. }), "{error}");
     }
 
-    #[tokio::test]
-    async fn a_post_with_a_broken_blob_reference_can_never_be_archived() {
+    #[test]
+    fn a_post_with_a_broken_blob_reference_says_what_the_backup_lacks() {
         for broken in [
             json!({ "$type": "blob", "ref": { "$link": IMAGE_ONE }, "mimeType": "image/jpeg" }),
             json!({ "$type": "blob", "ref": { "$link": "not a cid" }, "mimeType": "image/jpeg", "size": 9 }),
             json!({ "$type": "blob", "ref": { "$link": IMAGE_ONE }, "mimeType": "image/jpeg", "size": -1 }),
         ] {
-            let found = media_of(json!({
+            let item = item_of(json!({
                 "$type": "app.bsky.embed.images",
-                "images": [{ "alt": "", "image": broken }],
+                "images": [
+                    { "alt": "", "image": broken },
+                    { "alt": "", "image": blob(IMAGE_TWO, "image/png", 200) },
+                ],
             }));
-            assert_eq!(found.len(), 1, "a post must not read as having no files");
-
-            let error = adapter_on_pds(image_one_reply())
-                .await
-                .0
-                .fetch_media(&post_ref(), &found[0])
-                .await
-                .unwrap_err();
-            assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+            assert!(item.backup_gap.is_some());
+            assert_eq!(item.media, [media(IMAGE_TWO, "image/png", Some(200))]);
         }
+    }
+
+    #[test]
+    fn a_whole_post_has_nothing_missing_from_its_backup() {
+        let item = item_of(json!({
+            "$type": "app.bsky.embed.images",
+            "images": [{ "alt": "", "image": blob(IMAGE_ONE, "image/jpeg", 100) }],
+        }));
+        assert_eq!(item.backup_gap, None);
+    }
+
+    #[test]
+    fn the_backup_keeps_everything_the_person_wrote_in_a_post() {
+        let record = serde_json::from_value(json!({
+            "uri": POST,
+            "cid": IMAGE_ONE,
+            "value": {
+                "$type": "app.bsky.feed.post",
+                "text": "see this",
+                "createdAt": "2026-01-01T00:00:00.000Z",
+                "langs": ["en"],
+                "reply": {
+                    "root": { "uri": "at://did:plc:a/app.bsky.feed.post/root", "cid": IMAGE_ONE },
+                    "parent": { "uri": "at://did:plc:a/app.bsky.feed.post/parent", "cid": IMAGE_ONE },
+                },
+                "facets": [{
+                    "index": { "byteStart": 4, "byteEnd": 8 },
+                    "features": [{ "$type": "app.bsky.richtext.facet#link", "uri": "https://example.org/a" }],
+                }],
+                "embed": {
+                    "$type": "app.bsky.embed.recordWithMedia",
+                    "record": {
+                        "$type": "app.bsky.embed.record",
+                        "record": { "uri": "at://did:plc:a/app.bsky.feed.post/quoted", "cid": IMAGE_ONE },
+                    },
+                    "media": {
+                        "$type": "app.bsky.embed.images",
+                        "images": [{ "alt": "a red door", "image": blob(IMAGE_ONE, "image/jpeg", 100) }],
+                    },
+                },
+            },
+        }))
+        .unwrap();
+
+        let item = record_to_item(&record, COLLECTION_POST, ContentType::Post).unwrap();
+        let kept: serde_json::Value =
+            serde_json::from_str(item.platform_record.unwrap().as_json()).unwrap();
+
+        let post = &kept["value"];
+        assert_eq!(kept["uri"], POST);
+        assert_eq!(post["langs"][0], "en");
+        assert_eq!(post["reply"]["parent"]["uri"], "at://did:plc:a/app.bsky.feed.post/parent");
+        assert_eq!(post["facets"][0]["features"][0]["uri"], "https://example.org/a");
+        assert_eq!(post["facets"][0]["index"]["byteEnd"], 8);
+        assert_eq!(post["embed"]["record"]["record"]["uri"], "at://did:plc:a/app.bsky.feed.post/quoted");
+        assert_eq!(post["embed"]["media"]["images"][0]["alt"], "a red door");
+        assert_eq!(post["embed"]["media"]["images"][0]["image"]["ref"]["$link"], IMAGE_ONE);
+    }
+
+    #[test]
+    fn the_backup_keeps_a_link_cards_address_and_title() {
+        let item = item_of(json!({
+            "$type": "app.bsky.embed.external",
+            "external": { "uri": "https://example.org/a", "title": "A title", "description": "About it" },
+        }));
+        let kept: serde_json::Value =
+            serde_json::from_str(item.platform_record.unwrap().as_json()).unwrap();
+
+        let card = &kept["value"]["embed"]["external"];
+        assert_eq!(card["uri"], "https://example.org/a");
+        assert_eq!(card["title"], "A title");
     }
 
     #[tokio::test]

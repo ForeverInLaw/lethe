@@ -150,6 +150,8 @@ mod tests {
             engagement: Engagement { likes, ..Default::default() },
             scope_id: None,
             media: vec![],
+            platform_record: None,
+            backup_gap: None,
             item_ref: ItemRef { platform_id: "x".into(), token: None },
         }
     }

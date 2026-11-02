@@ -45,12 +45,15 @@ Current verification baseline:
 
 Telegram has passed live runs on a test group, including one with media files.
 Message text, media captions and media files go into the backup before the delete; a
-message whose file cannot be fetched stays where it is. Polls, locations and contacts
-back up without their content.
+message whose file cannot be fetched stays where it is. The backup also keeps each
+message whole as TDLib returned it, which is where polls, locations and contacts live.
+A message TDLib does not fully hand over is deleted only if the person agrees to that.
 
 In the desktop app, a Bluesky post goes into the backup with its text and every file
-it owns: images, video, captions and link card thumbnails. A post whose file cannot be
-fetched stays where it is. This has passed a live cleanup of posts with files.
+it owns: images, video, captions and link card thumbnails, along with the whole record
+the platform returned, so alt text, links and quotes stay too. A post whose file cannot
+be fetched stays where it is, and one with a broken file reference is deleted only if
+the person agrees to that. This has passed a live cleanup of posts with files.
 
 External contributions are not accepted yet: a CLA comes first.
 

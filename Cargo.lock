@@ -1465,6 +1465,7 @@ dependencies = [
  "async-trait",
  "futures",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "time",
  "url",
@@ -1570,6 +1571,7 @@ dependencies = [
  "async-trait",
  "futures",
  "lethe-adapter",
+ "serde_json",
  "tdlib-rs",
  "thiserror 2.0.18",
 ]

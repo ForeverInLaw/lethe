@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         plan: Default::default(),
         filter: dev_filter(),
         backup: true,
+        allow_incomplete_backup: false,
     };
 
     store.create_run(&lethe_store::NewRun {

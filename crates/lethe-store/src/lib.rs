@@ -2,7 +2,7 @@
 //!
 //! The connection is keyed with `PRAGMA key` before any other statement.
 
-use lethe_adapter::{ContentType, ItemRef, MediaRef, Outcome};
+use lethe_adapter::{ContentType, ItemRef, MediaRef, Outcome, PlatformRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 
 mod state;
@@ -26,6 +26,8 @@ pub struct ItemSnapshot {
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
     pub media: Vec<MediaRef>,
+    pub platform_record: Option<PlatformRecord>,
+    pub backup_gap: Option<String>,
     /// `protected` when matched by the allow-list/pin predicate, else `pending`.
     pub state: ItemState,
 }
@@ -39,6 +41,8 @@ pub struct PendingItem {
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
     pub media: Vec<MediaRef>,
+    pub platform_record: Option<PlatformRecord>,
+    pub backup_gap: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,8 +154,9 @@ impl Store {
         {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO items
-                 (run_id, platform_id, content_type, created_at, token, text, media_json, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (run_id, platform_id, content_type, created_at, token, text, media_json,
+                  platform_record, backup_gap, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for it in items {
                 let media_json = serde_json::to_string(&it.media)?;
@@ -163,6 +168,8 @@ impl Store {
                     it.item_ref.token,
                     it.text,
                     media_json,
+                    it.platform_record.as_ref().map(PlatformRecord::as_json),
+                    it.backup_gap,
                     it.state.as_str(),
                 ])?;
             }
@@ -207,6 +214,26 @@ impl Store {
                 largest_bytes: r.get::<_, i64>(1)? as u64,
             })
         })?)
+    }
+
+    /// Rows waiting to run whose content the backup cannot hold in full.
+    pub fn pending_backup_gaps(&self, run_id: &str) -> Result<u64> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT COUNT(*) FROM items
+             WHERE run_id = ?1 AND state = 'pending' AND backup_gap IS NOT NULL",
+        )?;
+        Ok(stmt.query_row(params![run_id], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// Keeps the rows the backup cannot hold in full, for a person who did not agree
+    /// to losing part of them.
+    pub fn protect_backup_gaps(&self, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET state = ?1
+             WHERE run_id = ?2 AND state = 'pending' AND backup_gap IS NOT NULL",
+            params![ItemState::Protected.as_str(), run_id],
+        )?;
+        Ok(())
     }
 
     /// Preview rows, newest first. Covers `pending` and `protected` only.
@@ -290,7 +317,8 @@ impl Store {
 
     pub fn claim_pending_items(&self, run_id: &str, n: usize) -> Result<Vec<PendingItem>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT platform_id, token, content_type, created_at, text, media_json FROM items
+            "SELECT platform_id, token, content_type, created_at, text, media_json,
+                    platform_record, backup_gap FROM items
              WHERE run_id = ?1 AND state = 'pending' LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![run_id, n as i64], |r| {
@@ -303,6 +331,17 @@ impl Store {
                 )
             })?;
             let content_type = parse_content_type_column(r, 2)?;
+            let platform_record = r
+                .get::<_, Option<String>>(6)?
+                .map(PlatformRecord::from_json)
+                .transpose()
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
             Ok(PendingItem {
                 item_ref: ItemRef {
                     platform_id: r.get(0)?,
@@ -312,6 +351,8 @@ impl Store {
                 created_at_secs: r.get(3)?,
                 text: r.get(4)?,
                 media,
+                platform_record,
+                backup_gap: r.get(7)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -319,12 +360,14 @@ impl Store {
     }
 
     /// Record batch outcomes in a single transaction (idempotent resume point).
-    /// Callers map `already-gone` to `Outcome::Deleted` before this.
+    /// Callers map `already-gone` to `Outcome::Deleted` before this. A row that ran
+    /// no longer needs its platform record, which can hold contacts and locations.
     pub fn record_outcomes(&mut self, run_id: &str, outcomes: &[(String, Outcome)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
-                "UPDATE items SET state = ?1, attempts = attempts + 1, last_error = ?2
+                "UPDATE items SET state = ?1, attempts = attempts + 1, last_error = ?2,
+                    platform_record = CASE WHEN ?1 = 'pending' THEN platform_record END
                  WHERE run_id = ?3 AND platform_id = ?4",
             )?;
             for (platform_id, outcome) in outcomes {
@@ -442,6 +485,12 @@ fn migrate_content_columns(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !column_exists(conn, "items", "platform_record")? {
+        conn.execute("ALTER TABLE items ADD COLUMN platform_record TEXT", [])?;
+    }
+    if !column_exists(conn, "items", "backup_gap")? {
+        conn.execute("ALTER TABLE items ADD COLUMN backup_gap TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -475,20 +524,25 @@ mod tests {
                 file_name: None,
                 size: None,
             }],
+            platform_record: None,
+            backup_gap: None,
             state,
+        }
+    }
+
+    fn run(id: &str) -> NewRun {
+        NewRun {
+            run_id: id.into(),
+            platform: "bluesky".into(),
+            account: "a".into(),
+            filter_json: "{}".into(),
+            started_secs: 0,
         }
     }
 
     fn run_with(items: &[ItemSnapshot]) -> Store {
         let s = Store::open_in_memory("k").unwrap();
-        s.create_run(&NewRun {
-            run_id: "r".into(),
-            platform: "bluesky".into(),
-            account: "a".into(),
-            filter_json: "{}".into(),
-            started_secs: 0,
-        })
-        .unwrap();
+        s.create_run(&run("r")).unwrap();
         s.snapshot_items("r", items).unwrap();
         s
     }
@@ -699,6 +753,95 @@ mod tests {
 
         // Resume: nothing left to do (idempotent).
         assert!(s.claim_pending_batch("r", 100).unwrap().is_empty());
+    }
+
+    fn record(json: &str) -> PlatformRecord {
+        PlatformRecord::from_json(json.into()).unwrap()
+    }
+
+    #[test]
+    fn a_platform_record_stays_until_its_item_ran() {
+        let mut s = Store::open_in_memory("k").unwrap();
+        s.create_run(&run("r")).unwrap();
+        let mut limited = snap("limited", ItemState::Pending);
+        limited.platform_record = Some(record(r#"{"poll":"tea or coffee"}"#));
+        let mut deleted = snap("deleted", ItemState::Pending);
+        deleted.platform_record = Some(record(r#"{"contact":"+0"}"#));
+        s.snapshot_items("r", &[limited, deleted, snap("plain", ItemState::Pending)])
+            .unwrap();
+
+        let claimed = s.claim_pending_items("r", 10).unwrap();
+        let of = |id: &str| claimed.iter().find(|item| item.item_ref.platform_id == id).unwrap();
+        assert_eq!(of("limited").platform_record, Some(record(r#"{"poll":"tea or coffee"}"#)));
+        assert_eq!(of("plain").platform_record, None);
+
+        s.record_outcomes(
+            "r",
+            &[
+                ("limited".into(), Outcome::RateLimited { retry_after_secs: 1 }),
+                ("deleted".into(), Outcome::Deleted),
+            ],
+        )
+        .unwrap();
+
+        let claimed = s.claim_pending_items("r", 10).unwrap();
+        let limited = claimed.iter().find(|item| item.item_ref.platform_id == "limited").unwrap();
+        assert!(limited.platform_record.is_some(), "it still has to reach the backup");
+        let left: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT platform_record FROM items WHERE platform_id = 'deleted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, None, "the local database must not outlive the delete");
+    }
+
+    #[test]
+    fn items_the_backup_cannot_hold_can_be_kept_as_protected() {
+        let s = Store::open_in_memory("k").unwrap();
+        s.create_run(&run("r")).unwrap();
+        let mut gap = snap("gap", ItemState::Pending);
+        gap.backup_gap = Some("no file".into());
+        let mut chosen = snap("chosen", ItemState::Protected);
+        chosen.backup_gap = Some("no file".into());
+        s.snapshot_items("r", &[gap, chosen, snap("whole", ItemState::Pending)])
+            .unwrap();
+        assert_eq!(s.pending_backup_gaps("r").unwrap(), 1);
+
+        s.protect_backup_gaps("r").unwrap();
+
+        let counts = s.preview_counts("r").unwrap();
+        assert_eq!((counts.pending, counts.protected), (1, 2));
+        assert_eq!(s.pending_backup_gaps("r").unwrap(), 0);
+    }
+
+    #[test]
+    fn a_database_from_before_platform_records_gains_the_columns() {
+        let path = std::env::temp_dir().join(format!("lethe-store-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.pragma_update(None, "key", "k").unwrap();
+            conn.execute_batch(include_str!("schema.sql")).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE items DROP COLUMN platform_record;
+                 ALTER TABLE items DROP COLUMN backup_gap;
+                 INSERT INTO runs (run_id, platform, account, filter_json, state, started)
+                 VALUES ('r', 'p', 'a', '{}', 'preview', 0);
+                 INSERT INTO items (run_id, platform_id, content_type, state)
+                 VALUES ('r', 'old', 'post', 'pending');",
+            )
+            .unwrap();
+        }
+
+        let s = Store::open(path, "k").unwrap();
+        let claimed = s.claim_pending_items("r", 10).unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        assert_eq!(claimed[0].platform_record, None);
+        assert_eq!(claimed[0].backup_gap, None);
     }
 
     #[test]
