@@ -27,15 +27,26 @@ pub struct PendingConsents {
     pub both: u64,
 }
 
+/// Which rows that go only with the person's agreement they agreed to delete.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Consents {
+    pub backup_gaps: bool,
+    pub only_for_self: bool,
+}
+
 impl Store {
-    pub fn pending_media(&self, run_id: &str) -> Result<PendingMedia> {
-        let mut stmt = self.conn.prepare_cached(
+    /// Files of the waiting rows that go with the agreements given.
+    pub fn pending_media(&self, run_id: &str, consents: Consents) -> Result<PendingMedia> {
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT COALESCE(SUM(json_extract(file.value, '$.size')), 0),
                     COALESCE(MAX(json_extract(file.value, '$.size')), 0)
              FROM items, json_each(items.media_json) AS file
-             WHERE items.run_id = ?1 AND items.state = 'pending'",
-        )?;
-        Ok(stmt.query_row(params![run_id], |r| {
+             WHERE items.run_id = ?1 AND items.state = 'pending'
+               AND (?2 OR NOT ({BACKUP_GAP}))
+               AND (?3 OR NOT ({ONLY_FOR_SELF}))"
+        ))?;
+        let params = params![run_id, consents.backup_gaps, consents.only_for_self];
+        Ok(stmt.query_row(params, |r| {
             Ok(PendingMedia {
                 bytes: r.get::<_, i64>(0)? as u64,
                 largest_bytes: r.get::<_, i64>(1)? as u64,
@@ -86,8 +97,8 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use crate::tests::{run_with, snap};
-    use crate::{ItemSnapshot, ItemState, PendingMedia};
-    use lethe_adapter::MediaRef;
+    use crate::{Consents, ItemSnapshot, ItemState, PendingMedia};
+    use lethe_adapter::{DeleteReach, MediaRef};
 
     fn sized(id: &str, state: ItemState, sizes: &[Option<u64>]) -> ItemSnapshot {
         ItemSnapshot {
@@ -113,15 +124,55 @@ mod tests {
             sized("d", ItemState::Pending, &[]),
         ]);
 
-        let media = s.pending_media("r").unwrap();
+        let media = s.pending_media("r", Consents::default()).unwrap();
 
         assert_eq!(media.bytes, 800);
         assert_eq!(media.largest_bytes, 700);
     }
 
     #[test]
+    fn pending_media_sizes_what_needs_agreement_only_once_agreed() {
+        let waiting = |id: &str, size: u64| sized(id, ItemState::Pending, &[Some(size)]);
+        let s = run_with(&[
+            waiting("plain", 1),
+            ItemSnapshot {
+                backup_gap: Some("too big".into()),
+                ..waiting("gap", 10)
+            },
+            ItemSnapshot {
+                delete_reach: DeleteReach::OnlyForSelf,
+                ..waiting("self", 100)
+            },
+            ItemSnapshot {
+                backup_gap: Some("too big".into()),
+                delete_reach: DeleteReach::OnlyForSelf,
+                ..waiting("both", 1_000)
+            },
+        ]);
+        let bytes = |backup_gaps, only_for_self| {
+            s.pending_media(
+                "r",
+                Consents {
+                    backup_gaps,
+                    only_for_self,
+                },
+            )
+            .unwrap()
+            .bytes
+        };
+
+        assert_eq!(bytes(false, false), 1);
+        assert_eq!(bytes(true, false), 11);
+        assert_eq!(bytes(false, true), 101);
+        assert_eq!(bytes(true, true), 1_111);
+    }
+
+    #[test]
     fn pending_media_is_empty_for_a_run_without_files() {
         let s = run_with(&[]);
-        assert_eq!(s.pending_media("r").unwrap(), PendingMedia::default());
+        assert_eq!(
+            s.pending_media("r", Consents::default()).unwrap(),
+            PendingMedia::default()
+        );
     }
 }

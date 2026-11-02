@@ -9,7 +9,7 @@ mod pending;
 mod retention;
 mod state;
 mod unsaved_files;
-pub use pending::{PendingConsents, PendingMedia};
+pub use pending::{Consents, PendingConsents, PendingMedia};
 pub use state::{FileFailure, ItemState, RunState};
 pub use unsaved_files::{FileRetryRun, UnsavedFiles, UnsavedItem};
 

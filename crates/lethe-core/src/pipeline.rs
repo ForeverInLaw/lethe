@@ -11,7 +11,7 @@ use futures::StreamExt;
 use lethe_adapter::{AdapterError, DeleteReach, EnumeratePlan, FetchedMedia, Item, MediaRef, Outcome, PlatformAdapter};
 use lethe_crypto::receipt::{ReceiptSigner, RunSummary, SignedReceipt};
 use lethe_crypto::DataKey;
-use lethe_store::{FileFailure, ItemSnapshot, ItemState, PendingItem, PreviewCounts, RunState, Store};
+use lethe_store::{Consents, FileFailure, ItemSnapshot, ItemState, PendingItem, PreviewCounts, RunState, Store};
 
 use crate::archive::ArchiveWriter;
 use crate::filter::{FilterSpec, Predicate};
@@ -185,7 +185,11 @@ pub async fn execute(
     let total = store.preview_counts(&req.run_id)?.pending;
     let _ = progress.send(ProgressEvent::Deleting { deleted: 0, skipped: 0, failed: 0, total });
 
-    let media_total_bytes = store.pending_media(&req.run_id)?.bytes;
+    let consents = Consents {
+        backup_gaps: req.allow_incomplete_backup,
+        only_for_self: req.allow_only_for_self,
+    };
+    let media_total_bytes = store.pending_media(&req.run_id, consents)?.bytes;
     let mut media_done_bytes = 0;
     // A rate-limited delete comes back in the next claim; its backup is already done.
     let mut archived: HashSet<String> = HashSet::new();
