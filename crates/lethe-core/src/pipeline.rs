@@ -36,8 +36,8 @@ pub struct RunRequest {
     /// The person agreed to delete items the backup cannot hold in full. Without
     /// this, such items stay on the platform.
     pub allow_incomplete_backup: bool,
-    /// The person agreed to delete items whose files the platform no longer hands
-    /// over. A file that is only out of reach for now keeps its item regardless.
+    /// The person agreed to delete items whose files the platform refuses to hand
+    /// over. Any other download error keeps its item regardless.
     pub allow_lost_files: bool,
 }
 
@@ -189,7 +189,6 @@ pub async fn execute(
 
         let mut deletable = Vec::with_capacity(batch.len());
         let mut records = Vec::new();
-        let mut file_failures = Vec::new();
         let mut retry_after_secs: Option<u64> = None;
 
         for item in &batch {
@@ -223,13 +222,19 @@ pub async fn execute(
                 }
                 ArchiveResult::FetchFailed(error) => {
                     outcome.failed += 1;
-                    let failure = if is_lost_for_good(&error) {
-                        FileFailure::Unavailable
-                    } else {
-                        FileFailure::Unreachable
+                    let failure = match error {
+                        AdapterError::FileRefused(_) => FileFailure::Unavailable,
+                        _ => FileFailure::Unreachable,
                     };
                     let reason = format!("not backed up, so not deleted: {error}");
-                    file_failures.push((platform_id.clone(), failure, reason));
+                    // Right away: a stop later in this batch must not lose it from the list.
+                    store.record_file_failures(&req.run_id, &[(platform_id.clone(), failure, reason)])?;
+                    let _ = progress.send(ProgressEvent::Deleting {
+                        deleted: outcome.deleted,
+                        skipped: outcome.skipped,
+                        failed: outcome.failed,
+                        total,
+                    });
                 }
             }
         }
@@ -266,9 +271,6 @@ pub async fn execute(
         }
         if !records.is_empty() {
             store.record_outcomes(&req.run_id, &records)?;
-        }
-        if !file_failures.is_empty() {
-            store.record_file_failures(&req.run_id, &file_failures)?;
         }
 
         let _ = progress.send(ProgressEvent::Deleting {
@@ -359,14 +361,9 @@ async fn wait(delay: Duration, control: &RunControl) -> bool {
     true
 }
 
-/// The platform answered and refused the file. Anything else may pass with time.
-fn is_lost_for_good(error: &AdapterError) -> bool {
-    matches!(error, AdapterError::Platform(_) | AdapterError::Unsupported(_))
-}
-
 /// Downloads an item's files and archives them with its record. Unless the result
 /// is `Archived`, nothing was written and the item must not be deleted. With
-/// `allow_lost_files`, a file lost for good leaves a hole in the record instead. An
+/// `allow_lost_files`, a file the platform refuses leaves a hole in the record instead. An
 /// error means the archive itself failed and the run must end.
 async fn archive_item(
     adapter: &dyn PlatformAdapter,
@@ -376,7 +373,7 @@ async fn archive_item(
     control: &RunControl,
 ) -> Result<ArchiveResult> {
     let mut files = Vec::with_capacity(item.media.len());
-    let mut lost = Vec::new();
+    let mut lost_reasons = Vec::new();
     let mut result = ArchiveResult::Archived;
     for media in &item.media {
         match fetch_file(adapter, item, media, control).await {
@@ -385,9 +382,9 @@ async fn archive_item(
                 break;
             }
             Some(Ok(file)) => files.push(Some(file)),
-            Some(Err(error)) if allow_lost_files && is_lost_for_good(&error) => {
+            Some(Err(error @ AdapterError::FileRefused(_))) if allow_lost_files => {
                 files.push(None);
-                lost.push(error.to_string());
+                lost_reasons.push(error.to_string());
             }
             Some(Err(error)) => {
                 result = ArchiveResult::FetchFailed(error);
@@ -397,7 +394,7 @@ async fn archive_item(
     }
 
     let written = match result {
-        ArchiveResult::Archived => writer.write_item(item, &files, &lost),
+        ArchiveResult::Archived => writer.write_item(item, &files, &lost_reasons),
         _ => Ok(()),
     };
     for file in files.iter().flatten() {

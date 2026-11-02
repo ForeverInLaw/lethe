@@ -42,7 +42,7 @@ async fn a_lasting_network_problem_keeps_the_item_after_the_last_retry() {
 #[tokio::test]
 async fn a_file_the_platform_refuses_is_not_retried() {
     let adapter = Arc::new(MediaAdapter::new(vec![media_item("m", &[("photo", 3)])], |_, _| {
-        Err(AdapterError::Platform("the PDS no longer has this file".into()))
+        Err(AdapterError::FileRefused("the PDS no longer has this file".into()))
     }));
 
     let run = run_media(adapter.clone(), RunControl::new()).await;
@@ -56,7 +56,7 @@ async fn an_item_that_stayed_is_listed_with_why() {
     let adapter = Arc::new(MediaAdapter::new(
         vec![media_item("lost", &[("gone", 3)]), media_item("cut", &[("offline", 3)])],
         |media, _| match media.url.as_str() {
-            "gone" => Err(AdapterError::Platform("the PDS no longer has this file".into())),
+            "gone" => Err(AdapterError::FileRefused("the PDS no longer has this file".into())),
             _ => Err(AdapterError::Auth("session expired".into())),
         },
     ));
@@ -76,7 +76,7 @@ async fn with_consent_a_lost_file_no_longer_keeps_its_item_and_the_backup_says_s
         vec![media_item("album", &[("first", 3), ("gone", 3)])],
         |media, _| match media.url.as_str() {
             "first" => Ok(downloaded(b"abc")),
-            _ => Err(AdapterError::Platform("the PDS no longer has this file".into())),
+            _ => Err(AdapterError::FileRefused("the PDS no longer has this file".into())),
         },
     ));
 
@@ -96,7 +96,7 @@ async fn with_consent_a_lost_file_no_longer_keeps_its_item_and_the_backup_says_s
     let names: Vec<_> = std::fs::read_dir(report.folder.join("files")).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert_eq!(names, ["first.jpg"]);
     let messages = std::fs::read_to_string(report.folder.join("messages.txt")).unwrap();
-    assert!(messages.contains("a file could not be saved: platform error: the PDS no longer has this file"), "{messages}");
+    assert!(messages.contains("a file could not be saved: the platform refuses this file: the PDS no longer has this file"), "{messages}");
     std::fs::remove_dir_all(&folder).unwrap();
 }
 
@@ -111,4 +111,43 @@ async fn consent_does_not_cover_a_file_that_is_only_out_of_reach() {
     assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1 });
     assert!(!adapter.journal().contains(&"delete m".to_string()));
     assert_eq!(run.store.unsaved_files("media", 10).unwrap().total, 1);
+}
+
+#[tokio::test]
+async fn consent_does_not_cover_an_error_that_is_not_a_refusal() {
+    for error in ["platform", "auth"] {
+        let adapter = Arc::new(MediaAdapter::new(vec![media_item("m", &[("photo", 3)])], move |_, _| {
+            Err(match error {
+                "platform" => AdapterError::Platform("bad request".into()),
+                _ => AdapterError::Auth("session expired".into()),
+            })
+        }));
+
+        let run = run_media_allowing_lost_files(adapter.clone()).await;
+
+        assert!(!adapter.journal().contains(&"delete m".to_string()), "{error}");
+        assert_eq!(run.store.unsaved_files("media", 10).unwrap().unavailable, 0, "{error}");
+    }
+}
+
+#[tokio::test]
+async fn stopping_the_run_keeps_the_list_of_what_stayed() {
+    let control = RunControl::new();
+    let stop = control.clone();
+    let adapter = Arc::new(MediaAdapter::new(
+        vec![media_item("kept", &[("gone", 3)]), media_item("next", &[("stops", 3)])],
+        move |media, _| match media.url.as_str() {
+            "gone" => Err(AdapterError::FileRefused("the PDS no longer has this file".into())),
+            _ => {
+                stop.stop();
+                Err(AdapterError::Transport("connection reset".into()))
+            }
+        },
+    ));
+
+    let run = run_media(adapter, control).await;
+
+    assert!(run.outcome.is_err());
+    let listed: Vec<_> = run.store.unsaved_files("media", 10).unwrap().items.into_iter().map(|item| item.platform_id).collect();
+    assert_eq!(listed, ["kept"]);
 }

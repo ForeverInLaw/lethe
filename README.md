@@ -51,9 +51,9 @@ A message TDLib does not fully hand over is deleted only if the person agrees to
 
 A network problem gets three retries, about 40 seconds in all. A file that still did not
 reach the backup keeps its item, and `Store::unsaved_files` lists it. `Store::retry_unsaved_files`
-opens a follow-up run for those items. With `RunRequest::allow_lost_files`, an item whose file
-the platform refuses goes without that file, and its backup entry says so. A file that is only
-out of reach keeps its item either way.
+opens a follow-up run for those items. With `RunRequest::allow_lost_files`, an item goes without
+a file when the adapter reports `AdapterError::FileRefused`, and its backup entry says so. Any
+other download error keeps the item.
 
 In the desktop app, a Bluesky post goes into the backup with its text and every file
 it owns: images, video, captions and link card thumbnails, along with the whole record

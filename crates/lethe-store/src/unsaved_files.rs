@@ -2,11 +2,10 @@
 //! the follow-up run that tries them again. Such a row keeps its platform record
 //! until a later run settles the item, because the backup still needs it.
 
-use lethe_adapter::ContentType;
 use rusqlite::{params, Connection};
 
 use crate::state::{FileFailure, ItemState, RunState};
-use crate::{parse_content_type_column, Result, Store};
+use crate::{Result, Store};
 
 /// The rows of run `?1` still waiting on a file. A later run of the same account
 /// settles a row by getting to the same item, whatever the outcome.
@@ -22,7 +21,6 @@ const STILL_UNSAVED: &str = "items.run_id = ?1 AND items.state = 'failed' AND it
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsavedItem {
     pub platform_id: String,
-    pub content_type: ContentType,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
     pub failure: FileFailure,
@@ -83,17 +81,16 @@ impl Store {
             |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
         )?;
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT platform_id, content_type, created_at, text, file_failure FROM items
+            "SELECT platform_id, created_at, text, file_failure FROM items
              WHERE {STILL_UNSAVED} ORDER BY created_at DESC, platform_id LIMIT ?2"
         ))?;
         let items = stmt
             .query_map(params![run_id, limit], |r| {
                 Ok(UnsavedItem {
                     platform_id: r.get(0)?,
-                    content_type: parse_content_type_column(r, 1)?,
-                    created_at_secs: r.get(2)?,
-                    text: r.get(3)?,
-                    failure: FileFailure::from_stored(&r.get::<_, String>(4)?),
+                    created_at_secs: r.get(1)?,
+                    text: r.get(2)?,
+                    failure: FileFailure::from_stored(&r.get::<_, String>(3)?),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -160,7 +157,7 @@ pub(crate) fn forget_earlier_records(conn: &Connection, run_id: &str, platform_i
 mod tests {
     use super::*;
     use crate::{ItemSnapshot, NewRun};
-    use lethe_adapter::{ItemRef, MediaRef, Outcome, PlatformRecord};
+    use lethe_adapter::{ContentType, ItemRef, MediaRef, Outcome, PlatformRecord};
 
     const ACCOUNT: &str = "acc";
 

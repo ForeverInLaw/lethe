@@ -83,6 +83,23 @@ fn map_err<E: std::fmt::Display + std::fmt::Debug>(e: atrium_api::xrpc::Error<E>
     AdapterError::Transport(e.to_string())
 }
 
+/// The file is gone, but the post may not be: core must not count it as deleted. Only
+/// the PDS naming this blob or repo as unavailable is a refusal; an expired session
+/// comes back as a 400 or 401 too, and says nothing about the file.
+fn map_blob_error(
+    e: atrium_api::xrpc::Error<atrium_api::com::atproto::sync::get_blob::Error>,
+) -> AdapterError {
+    if let atrium_api::xrpc::Error::XrpcResponse(ref resp) = e {
+        if matches!(resp.error, Some(atrium_api::xrpc::error::XrpcErrorKind::Custom(_))) {
+            return AdapterError::FileRefused(e.to_string());
+        }
+    }
+    match map_err(e) {
+        AdapterError::NotFound => AdapterError::FileRefused("the PDS no longer has this file".into()),
+        other => other,
+    }
+}
+
 /// The `value` of a feed record, parsed best-effort for the core predicate.
 /// Engagement counts are not on the record itself (they need the feed API), so
 /// they stay `None` for the tracer.
@@ -231,15 +248,9 @@ impl PlatformAdapter for BlueskyAdapter {
             .sync
             .get_blob(params.into())
             .await
-            .map_err(|e| match map_err(e) {
-                // The file is gone, but the post may not be: core must not count it as deleted.
-                AdapterError::NotFound => {
-                    AdapterError::Platform("the PDS no longer has this file".into())
-                }
-                other => other,
-            })?;
+            .map_err(map_blob_error)?;
         if !is_content_of(&bytes, &expected) {
-            return Err(AdapterError::Platform(
+            return Err(AdapterError::Transport(
                 "the downloaded file does not match the post".into(),
             ));
         }
@@ -673,7 +684,7 @@ mod tests {
 
         let error = fetch_image_one(&a).await.unwrap_err();
 
-        assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+        assert!(matches!(error, AdapterError::Transport(_)), "{error}");
     }
 
     #[tokio::test]
@@ -686,7 +697,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+        assert!(matches!(error, AdapterError::Transport(_)), "{error}");
     }
 
     #[tokio::test]
@@ -695,7 +706,31 @@ mod tests {
 
         let error = fetch_image_one(&a).await.unwrap_err();
 
-        assert!(matches!(error, AdapterError::Platform(_)), "{error}");
+        assert!(matches!(error, AdapterError::FileRefused(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_pds_naming_a_blob_as_missing_is_a_refusal() {
+        let reply = ResponseTemplate::new(400)
+            .set_body_json(serde_json::json!({ "error": "BlobNotFound", "message": "Blob not found" }));
+        let (a, _pds) = adapter_on_pds(reply).await;
+
+        let error = fetch_image_one(&a).await.unwrap_err();
+
+        assert!(matches!(error, AdapterError::FileRefused(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_expired_session_is_not_a_refusal() {
+        let expired = ResponseTemplate::new(400)
+            .set_body_json(serde_json::json!({ "error": "ExpiredToken", "message": "Token has expired" }));
+        for reply in [expired, ResponseTemplate::new(401)] {
+            let (a, _pds) = adapter_on_pds(reply).await;
+
+            let error = fetch_image_one(&a).await.unwrap_err();
+
+            assert!(!matches!(error, AdapterError::FileRefused(_)), "{error}");
+        }
     }
 
     #[tokio::test]

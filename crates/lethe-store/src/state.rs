@@ -28,8 +28,8 @@ pub enum FileFailure {
     /// The platform refused the file, so trying again is unlikely to help. The item
     /// may go without it, with the person's consent.
     Unavailable,
-    /// The network or the session stood in the way. The file may still be there, so
-    /// the item only goes once the file is saved or turns out to be unavailable.
+    /// Anything else, such as the network or the session. The file may still be
+    /// there, so the item only goes once it is saved or the platform refuses it.
     Unreachable,
 }
 

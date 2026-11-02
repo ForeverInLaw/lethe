@@ -82,12 +82,12 @@ impl ArchiveWriter {
     }
 
     /// Appends one item and its files. `files` lines up with `item.media`; `None` is
-    /// a file that could not be saved, and `lost` says why.
+    /// a file that could not be saved, and `lost_reasons` says why.
     pub(crate) fn write_item(
         &mut self,
         item: &PendingItem,
         files: &[Option<FetchedMedia>],
-        lost: &[String],
+        lost_reasons: &[String],
     ) -> Result<()> {
         let sizes = files
             .iter()
@@ -100,7 +100,7 @@ impl ArchiveWriter {
             .backup_gap
             .iter()
             .cloned()
-            .chain(lost.iter().map(|reason| format!("a file could not be saved: {reason}")))
+            .chain(lost_reasons.iter().map(|reason| format!("a file could not be saved: {reason}")))
             .collect::<Vec<_>>()
             .join("; ");
         let record = ItemRecord {

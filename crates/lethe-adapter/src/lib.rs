@@ -35,6 +35,10 @@ pub enum AdapterError {
     /// Item already gone. The pipeline treats this as success (idempotent resume).
     #[error("item not found (treat as already-deleted)")]
     NotFound,
+    /// The platform answered that it will not hand over this file. Only this says
+    /// the file is lost; any other error may pass with time.
+    #[error("the platform refuses this file: {0}")]
+    FileRefused(String),
     #[error("transport error: {0}")]
     Transport(String),
     #[error("platform error: {0}")]
