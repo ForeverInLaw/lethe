@@ -9,7 +9,7 @@ use crate::{ItemState, Result, Store};
 /// A row the backup cannot hold in full.
 const BACKUP_GAP: &str = "items.backup_gap IS NOT NULL";
 /// A row whose delete hides it only from this account.
-const ONLY_FOR_SELF: &str = "items.delete_reach = 'only_for_self'";
+pub(crate) const ONLY_FOR_SELF: &str = "items.delete_reach = 'only_for_self'";
 
 /// Files still to be archived for a run, as far as Phase 1 knows their sizes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

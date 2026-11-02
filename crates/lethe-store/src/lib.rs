@@ -73,21 +73,49 @@ pub struct PreviewCounts {
     pub undeletable: u64,
 }
 
-/// One preview row as a UI lists it: what will go, or what was protected.
+/// One preview row as a UI lists it: what will go, what was protected, or what the
+/// platform does not let this account delete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemRow {
     pub platform_id: String,
     pub content_type: ContentType,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
-    pub protected: bool,
+    /// `Pending`, `Protected` or `Undeletable`.
+    pub state: ItemState,
     pub only_for_self: bool,
+}
+
+/// Which preview rows a list shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemGroup {
+    /// What the person can choose about: what goes and what they protected.
+    #[default]
+    All,
+    Protected,
+    /// Of `All`, what only this account would stop seeing.
+    OnlyForSelf,
+    /// What the platform does not let this account delete.
+    Undeletable,
+}
+
+impl ItemGroup {
+    fn condition(self) -> String {
+        const CHOOSABLE: &str = "state IN ('pending', 'protected')";
+        match self {
+            ItemGroup::All => CHOOSABLE.into(),
+            ItemGroup::Protected => "state = 'protected'".into(),
+            ItemGroup::OnlyForSelf => format!("{CHOOSABLE} AND {}", pending::ONLY_FOR_SELF),
+            ItemGroup::Undeletable => "state = 'undeletable'".into(),
+        }
+    }
 }
 
 /// Which preview rows to page through. Rows that already ran are never listed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ItemQuery {
-    pub protected_only: bool,
+    pub group: ItemGroup,
     pub content_type: Option<ContentType>,
     pub offset: u32,
     pub limit: u32,
@@ -231,21 +259,19 @@ impl Store {
         Ok(c)
     }
 
-    /// Preview rows, newest first. Covers `pending` and `protected` only.
+    /// Preview rows of one group, newest first.
     pub fn preview_items(&self, run_id: &str, query: &ItemQuery) -> Result<Vec<ItemRow>> {
-        let mut stmt = self.conn.prepare_cached(
+        let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT platform_id, content_type, created_at, text, state, delete_reach FROM items
-             WHERE run_id = ?1
-               AND state IN ('pending', 'protected')
-               AND (?2 = 0 OR state = 'protected')
-               AND (?3 IS NULL OR content_type = ?3)
+             WHERE run_id = ?1 AND {}
+               AND (?2 IS NULL OR content_type = ?2)
              ORDER BY created_at DESC, platform_id
-             LIMIT ?4 OFFSET ?5",
-        )?;
+             LIMIT ?3 OFFSET ?4",
+            query.group.condition()
+        ))?;
         let rows = stmt.query_map(
             params![
                 run_id,
-                query.protected_only,
                 query.content_type.map(content_type_str),
                 i64::from(query.limit),
                 i64::from(query.offset),
@@ -256,7 +282,12 @@ impl Store {
                     content_type: parse_content_type_column(r, 1)?,
                     created_at_secs: r.get(2)?,
                     text: r.get(3)?,
-                    protected: r.get::<_, String>(4)? == ItemState::Protected.as_str(),
+                    // Every group lists only these three states.
+                    state: match r.get::<_, String>(4)?.as_str() {
+                        "protected" => ItemState::Protected,
+                        "undeletable" => ItemState::Undeletable,
+                        _ => ItemState::Pending,
+                    },
                     only_for_self: state::reach_from_stored(&r.get::<_, String>(5)?)
                         == DeleteReach::OnlyForSelf,
                 })
@@ -649,13 +680,47 @@ mod tests {
             .preview_items(
                 "r",
                 &ItemQuery {
-                    protected_only: true,
+                    group: ItemGroup::Protected,
                     ..all
                 },
             )
             .unwrap();
         assert_eq!(ids(&protected), ["new"]);
-        assert!(protected[0].protected);
+        assert_eq!(protected[0].state, ItemState::Protected);
+    }
+
+    #[test]
+    fn preview_items_list_what_goes_only_for_self_and_what_cannot_go_apart() {
+        let reaching = |id: &str, delete_reach, state| ItemSnapshot {
+            delete_reach,
+            ..snap(id, state)
+        };
+        let s = run_with(&[
+            snap("everyone", ItemState::Pending),
+            reaching("mine", DeleteReach::OnlyForSelf, ItemState::Pending),
+            reaching("mine-kept", DeleteReach::OnlyForSelf, ItemState::Protected),
+            reaching("theirs", DeleteReach::Nowhere, ItemState::Undeletable),
+        ]);
+        let listed = |group| {
+            s.preview_items(
+                "r",
+                &ItemQuery {
+                    group,
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            ids(&listed(ItemGroup::All)),
+            ["everyone", "mine", "mine-kept"]
+        );
+        assert_eq!(ids(&listed(ItemGroup::OnlyForSelf)), ["mine", "mine-kept"]);
+        let undeletable = listed(ItemGroup::Undeletable);
+        assert_eq!(ids(&undeletable), ["theirs"]);
+        assert_eq!(undeletable[0].state, ItemState::Undeletable);
     }
 
     #[test]
