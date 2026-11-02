@@ -5,6 +5,7 @@
 use lethe_adapter::{ContentType, DeleteReach, ItemRef, MediaRef, Outcome, PlatformRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 
+mod retention;
 mod state;
 mod unsaved_files;
 pub use state::{FileFailure, ItemState, RunState};
@@ -136,19 +137,21 @@ impl Store {
     /// Open (or create) the encrypted DB and run migrations. `key` is the
     /// SQLCipher passphrase (derived/held by the app layer).
     pub fn open(path: &str, key: &str) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.pragma_update(None, "key", key)?;
-        conn.execute_batch(include_str!("schema.sql"))?;
-        migrate_content_columns(&conn)?;
-        Ok(Self { conn })
+        Self::init(Connection::open(path)?, key)
     }
 
     /// In-memory store for tests.
     pub fn open_in_memory(key: &str) -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        Self::init(Connection::open_in_memory()?, key)
+    }
+
+    fn init(conn: Connection, key: &str) -> Result<Self> {
         conn.pragma_update(None, "key", key)?;
+        // Content the store forgets is zeroed on disk, not left in free pages.
+        conn.pragma_update(None, "secure_delete", true)?;
         conn.execute_batch(include_str!("schema.sql"))?;
         migrate_content_columns(&conn)?;
+        retention::forget_what_older_versions_kept(&conn)?;
         Ok(Self { conn })
     }
 
@@ -423,13 +426,16 @@ impl Store {
 
     /// Record batch outcomes in a single transaction (idempotent resume point).
     /// Callers map `already-gone` to `Outcome::Deleted` before this. A row that ran
-    /// no longer needs its platform record, which can hold contacts and locations.
+    /// keeps none of its content: the backup holds it, and a second copy here would
+    /// outlive the delete.
     pub fn record_outcomes(&mut self, run_id: &str, outcomes: &[(String, Outcome)]) -> Result<()> {
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
                 "UPDATE items SET state = ?1, attempts = attempts + 1, last_error = ?2,
-                    platform_record = CASE WHEN ?1 = 'pending' THEN platform_record END
+                    platform_record = CASE WHEN ?1 = 'pending' THEN platform_record END,
+                    text = CASE WHEN ?1 = 'pending' THEN text END,
+                    media_json = CASE WHEN ?1 = 'pending' THEN media_json ELSE '[]' END
                  WHERE run_id = ?3 AND platform_id = ?4",
             )?;
             for (platform_id, outcome) in outcomes {
@@ -441,7 +447,7 @@ impl Store {
                 };
                 stmt.execute(params![state, err, run_id, platform_id])?;
                 if state != ItemState::Pending.as_str() {
-                    unsaved_files::forget_earlier_records(&tx, run_id, platform_id)?;
+                    unsaved_files::drop_earlier_copies(&tx, run_id, platform_id)?;
                 }
             }
         }
@@ -449,6 +455,8 @@ impl Store {
         Ok(())
     }
 
+    /// Stores the signed receipt. From then on the run keeps only the items still
+    /// waiting on a file.
     pub fn save_receipt(
         &self,
         run_id: &str,
@@ -456,11 +464,14 @@ impl Store {
         public_key_hex: &str,
         signature_hex: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO receipts (run_id, summary_json, public_key_hex, signature_hex)
              VALUES (?1, ?2, ?3, ?4)",
             params![run_id, summary_json, public_key_hex, signature_hex],
         )?;
+        retention::drop_receipted_rows(&tx, Some(run_id))?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -941,15 +952,40 @@ mod tests {
         let claimed = s.claim_pending_items("r", 10).unwrap();
         let limited = claimed.iter().find(|item| item.item_ref.platform_id == "limited").unwrap();
         assert!(limited.platform_record.is_some(), "it still has to reach the backup");
-        let left: Option<String> = s
-            .conn
+        assert!(limited.text.is_some() && !limited.media.is_empty());
+        assert_eq!(content_of(&s, "deleted"), (None, None, "[]".into()), "the local database must not outlive the delete");
+    }
+
+    /// The record, text and files a row still holds.
+    fn content_of(s: &Store, platform_id: &str) -> (Option<String>, Option<String>, String) {
+        s.conn
             .query_row(
-                "SELECT platform_record FROM items WHERE platform_id = 'deleted'",
-                [],
-                |row| row.get(0),
+                "SELECT platform_record, text, media_json FROM items WHERE platform_id = ?1",
+                [platform_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .unwrap();
-        assert_eq!(left, None, "the local database must not outlive the delete");
+            .unwrap()
+    }
+
+    #[test]
+    fn a_row_that_ran_keeps_no_content_whatever_the_outcome() {
+        let mut s = run_with(&[
+            snap("skipped", ItemState::Pending),
+            snap("failed", ItemState::Pending),
+        ]);
+
+        s.record_outcomes(
+            "r",
+            &[
+                ("skipped".into(), Outcome::Skipped { reason: "gone".into() }),
+                ("failed".into(), Outcome::Failed { reason: "denied".into(), retryable: false }),
+            ],
+        )
+        .unwrap();
+
+        for id in ["skipped", "failed"] {
+            assert_eq!(content_of(&s, id), (None, None, "[]".into()), "{id}");
+        }
     }
 
     #[test]

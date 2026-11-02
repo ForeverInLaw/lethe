@@ -1,22 +1,16 @@
 //! Items that stayed on the platform because their file could not be saved, and
-//! the follow-up run that tries them again. Such a row keeps its platform record
-//! until a later run settles the item, because the backup still needs it.
+//! the follow-up run that tries them again. Such a row keeps its content until a
+//! later run of the same account gets to the item, because the backup still needs
+//! it. Then the later run holds the item, and the earlier row goes.
 
 use rusqlite::{params, Connection};
 
 use crate::state::{FileFailure, ItemState, RunState};
 use crate::{Result, Store};
 
-/// The rows of run `?1` still waiting on a file. A later run of the same account
-/// settles a row by getting to the same item, whatever the outcome.
-const STILL_UNSAVED: &str = "items.run_id = ?1 AND items.state = 'failed' AND items.file_failure IS NOT NULL
-     AND NOT EXISTS (
-        SELECT 1 FROM runs this
-        JOIN runs later ON later.rowid > this.rowid
-            AND later.platform = this.platform AND later.account = this.account
-        JOIN items settled ON settled.run_id = later.run_id AND settled.platform_id = items.platform_id
-        WHERE this.run_id = items.run_id AND settled.state IN ('deleted', 'skipped', 'failed')
-     )";
+/// A row that stayed because its file did not reach the backup, so a retry still
+/// needs all of its content.
+pub(crate) const WAITS_ON_A_FILE: &str = "items.state = 'failed' AND items.file_failure IS NOT NULL";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsavedItem {
@@ -64,7 +58,7 @@ impl Store {
                     run_id,
                     platform_id
                 ])?;
-                forget_earlier_records(&tx, run_id, platform_id)?;
+                drop_earlier_copies(&tx, run_id, platform_id)?;
             }
         }
         tx.commit()?;
@@ -75,14 +69,14 @@ impl Store {
         let (total, unavailable) = self.conn.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM(items.file_failure = 'unavailable'), 0)
-                 FROM items WHERE {STILL_UNSAVED}"
+                 FROM items WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE}"
             ),
             params![run_id],
             |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
         )?;
         let mut stmt = self.conn.prepare(&format!(
             "SELECT platform_id, created_at, text, file_failure FROM items
-             WHERE {STILL_UNSAVED} ORDER BY created_at DESC, platform_id LIMIT ?2"
+             WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE} ORDER BY created_at DESC, platform_id LIMIT ?2"
         ))?;
         let items = stmt
             .query_map(params![run_id, limit], |r| {
@@ -122,7 +116,8 @@ impl Store {
                 "INSERT INTO items (run_id, platform_id, content_type, created_at, token, text, media_json,
                                     platform_record, backup_gap, delete_reach, state)
                  SELECT ?2, platform_id, content_type, created_at, token, text, media_json,
-                        platform_record, backup_gap, delete_reach, ?3 FROM items WHERE {STILL_UNSAVED}"
+                        platform_record, backup_gap, delete_reach, ?3
+                 FROM items WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE}"
             ),
             params![from_run_id, new_run_id, ItemState::Pending.as_str()],
         )?;
@@ -137,19 +132,35 @@ impl Store {
     }
 }
 
-/// Earlier runs that still hold this item no longer need its platform record once
-/// a later run has dealt with the item, and the record can hold contacts and locations.
-pub(crate) fn forget_earlier_records(conn: &Connection, run_id: &str, platform_id: &str) -> Result<()> {
-    conn.prepare_cached(
-        "UPDATE items SET platform_record = NULL
-         WHERE platform_id = ?2 AND file_failure IS NOT NULL AND run_id IN (
-            SELECT earlier.run_id FROM runs this
-            JOIN runs earlier ON earlier.rowid < this.rowid
-                AND earlier.platform = this.platform AND earlier.account = this.account
-            WHERE this.run_id = ?1
-         )",
-    )?
+/// The earlier runs of the same account as run `this`.
+const EARLIER_RUNS: &str = "SELECT earlier.run_id FROM runs this
+    JOIN runs earlier ON earlier.rowid < this.rowid
+        AND earlier.platform = this.platform AND earlier.account = this.account";
+
+/// Once run `run_id` has dealt with an item, the earlier runs of the account that
+/// kept it for want of a file no longer need their row of it.
+pub(crate) fn drop_earlier_copies(conn: &Connection, run_id: &str, platform_id: &str) -> Result<()> {
+    conn.prepare_cached(&format!(
+        "DELETE FROM items WHERE platform_id = ?2 AND file_failure IS NOT NULL
+           AND run_id IN ({EARLIER_RUNS} WHERE this.run_id = ?1)"
+    ))?
     .execute(params![run_id, platform_id])?;
+    Ok(())
+}
+
+/// The same copies, for every item a later run already dealt with: older versions
+/// kept them.
+pub(crate) fn drop_copies_older_versions_kept(conn: &Connection) -> Result<()> {
+    conn.execute(
+        &format!(
+            "DELETE FROM items WHERE file_failure IS NOT NULL AND run_id IN (
+                {EARLIER_RUNS}
+                JOIN items settled ON settled.run_id = this.run_id AND settled.platform_id = items.platform_id
+                WHERE settled.state IN ('deleted', 'skipped', 'failed')
+             )"
+        ),
+        [],
+    )?;
     Ok(())
 }
 
@@ -311,25 +322,21 @@ mod tests {
     }
 
     #[test]
-    fn once_a_later_run_settles_an_item_its_platform_record_is_gone_from_the_earlier_run() {
+    fn once_a_later_run_settles_an_item_the_earlier_run_keeps_no_copy_of_it() {
         let mut store = store();
         run_of(&store, "r1", ACCOUNT, &["a"]);
         fail(&mut store, "r1", "a", FileFailure::Unavailable);
-        let record_of = |store: &Store| -> Option<String> {
+        let rows_in_r1 = |store: &Store| -> i64 {
             store
                 .conn
-                .query_row(
-                    "SELECT platform_record FROM items WHERE run_id = 'r1' AND platform_id = 'a'",
-                    [],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM items WHERE run_id = 'r1'", [], |r| r.get(0))
                 .unwrap()
         };
-        assert!(record_of(&store).is_some());
+        assert_eq!(rows_in_r1(&store), 1);
 
         store.retry_unsaved_files("r1", "r2", 20).unwrap();
         store.record_outcomes("r2", &[("a".into(), Outcome::Deleted)]).unwrap();
 
-        assert_eq!(record_of(&store), None);
+        assert_eq!(rows_in_r1(&store), 0);
     }
 }
