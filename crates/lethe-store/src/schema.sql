@@ -22,8 +22,8 @@ CREATE TABLE IF NOT EXISTS items (
     content_type TEXT    NOT NULL,
     created_at   INTEGER,
     token        TEXT,               -- opaque adapter delete-routing
-    text         TEXT,               -- Phase-1 text snapshot for backup
-    media_json   TEXT    NOT NULL DEFAULT '[]',
+    text         TEXT,               -- Phase-1 text snapshot for backup, until it ran
+    media_json   TEXT    NOT NULL DEFAULT '[]', -- its files, until it ran
     platform_record TEXT,            -- the item as the platform returned it, until it ran
     backup_gap   TEXT,               -- why the backup cannot hold all of it
     file_failure TEXT,               -- unavailable | unreachable: its file was not saved, so it stayed
