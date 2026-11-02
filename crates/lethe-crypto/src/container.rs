@@ -114,6 +114,10 @@ impl<R: Read> ContainerReader<R> {
         Ok(Self { source, stream, done: false })
     }
 
+    pub fn source(&self) -> &R {
+        &self.source
+    }
+
     pub fn read_chunk(&mut self) -> Result<Option<Vec<u8>>> {
         if self.done {
             return Ok(None);

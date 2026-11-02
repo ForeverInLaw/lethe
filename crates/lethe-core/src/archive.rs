@@ -13,6 +13,7 @@ mod export;
 
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::ops::ControlFlow;
 
 use lethe_adapter::{FetchedMedia, MediaRef, PlatformRecord};
 use lethe_crypto::container::{ContainerReader, ContainerWriter};
@@ -236,6 +237,7 @@ impl TryFrom<MediaFields> for ReadMedia {
 enum CopyFailure {
     Archive(EngineError),
     Output(io::Error),
+    Stopped,
 }
 
 impl From<CopyFailure> for EngineError {
@@ -243,6 +245,7 @@ impl From<CopyFailure> for EngineError {
         match failure {
             CopyFailure::Archive(error) => error,
             CopyFailure::Output(error) => io_error(error),
+            CopyFailure::Stopped => EngineError::Aborted,
         }
     }
 }
@@ -269,8 +272,19 @@ impl<R: Read> ArchiveWalk<R> {
         Ok(Some((record, chunk)))
     }
 
+    /// The source being read, to see how far the walk has come.
+    fn source(&self) -> &R {
+        self.reader.source()
+    }
+
     /// Copies the file that comes next in the archive, one chunk at a time.
-    fn copy_file(&mut self, stored: &StoredFile, out: &mut impl Write) -> std::result::Result<(), CopyFailure> {
+    /// `after_chunk` can stop the copy between chunks, since one file can be large.
+    fn copy_file(
+        &mut self,
+        stored: &StoredFile,
+        out: &mut impl Write,
+        mut after_chunk: impl FnMut(&R) -> ControlFlow<()>,
+    ) -> std::result::Result<(), CopyFailure> {
         let mut bytes = 0;
         for _ in 0..stored.chunks {
             let chunk = self
@@ -280,6 +294,9 @@ impl<R: Read> ArchiveWalk<R> {
                 .ok_or_else(|| CopyFailure::Archive(corrupt("a file is cut short")))?;
             out.write_all(&chunk).map_err(CopyFailure::Output)?;
             bytes += chunk.len() as u64;
+            if after_chunk(self.source()).is_break() {
+                return Err(CopyFailure::Stopped);
+            }
         }
         if bytes != stored.archived_bytes {
             return Err(CopyFailure::Archive(corrupt("a file does not match its record")));
@@ -296,7 +313,7 @@ pub fn audit_archive<R: Read>(source: R, key: &DataKey) -> Result<ArchiveAudit> 
     while let Some((record, _)) = walk.next_record()? {
         audit.items += 1;
         for stored in record.media.iter().filter_map(|media| media.stored.as_ref()) {
-            walk.copy_file(stored, &mut io::sink())?;
+            walk.copy_file(stored, &mut io::sink(), |_| ControlFlow::Continue(()))?;
             audit.media_files += 1;
         }
     }

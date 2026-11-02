@@ -90,7 +90,7 @@ async fn with_consent_a_lost_file_no_longer_keeps_its_item_and_the_backup_says_s
     let folder = std::env::temp_dir().join(format!("lethe-export-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&folder).unwrap();
     let export = ArchiveExport::open(std::fs::File::open(&run.archive).unwrap(), &ARCHIVE_KEY).unwrap();
-    let report = export.write_to(&folder, "export").unwrap();
+    let report = export.write_to(&folder, "export", |_| std::ops::ControlFlow::Continue(())).unwrap();
     assert!(report.complete);
     assert_eq!(report.media_files, 1);
     let names: Vec<_> = std::fs::read_dir(report.folder.join("files")).unwrap().map(|e| e.unwrap().file_name()).collect();

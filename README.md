@@ -70,7 +70,9 @@ the person agrees to that. This has passed a live cleanup of posts with files.
 
 `lethe_core::archive::ArchiveExport` turns a backup back into a plain folder: readable
 text, every record in full, and the files under their original names. A damaged or
-unsealed backup exports up to the point it breaks. The folder is not encrypted.
+unsealed backup exports up to the point it breaks. The folder is not encrypted. The
+caller hears how much of the backup has been read and can stop the export, which then
+removes its folder.
 
 External contributions are not accepted yet: a CLA comes first.
 

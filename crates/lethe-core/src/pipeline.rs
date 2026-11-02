@@ -1215,7 +1215,7 @@ mod tests {
         std::fs::create_dir(&parent).unwrap();
         let report = crate::archive::ArchiveExport::open(File::open(&run.archive).unwrap(), &ARCHIVE_KEY)
             .unwrap()
-            .write_to(&parent, "export")
+            .write_to(&parent, "export", |_| std::ops::ControlFlow::Continue(()))
             .unwrap();
         let messages = std::fs::read_to_string(report.folder.join("messages.txt")).unwrap();
         (report, messages)
