@@ -82,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         backup: true,
         allow_incomplete_backup: false,
         allow_lost_files: false,
+        allow_only_for_self: false,
     };
 
     store.create_run(&lethe_store::NewRun {
@@ -117,6 +118,7 @@ async fn main() -> anyhow::Result<()> {
         started_epoch_secs: 0,
         finished_epoch_secs: now_secs(),
         deleted: outcome.deleted,
+        deleted_only_for_self: outcome.deleted_only_for_self,
         skipped: outcome.skipped,
         failed: outcome.failed,
     };

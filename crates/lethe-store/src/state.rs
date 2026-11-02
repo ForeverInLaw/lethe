@@ -1,6 +1,8 @@
 //! Persisted state strings. Kept as explicit string mappings so the DB stays
 //! human-readable and stable across refactors.
 
+use lethe_adapter::DeleteReach;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemState {
     Pending,
@@ -8,6 +10,9 @@ pub enum ItemState {
     Deleted,
     Skipped,
     Failed,
+    /// In the set, but the platform does not let this account delete it. No run
+    /// touches it, and the preview cannot select it.
+    Undeletable,
 }
 
 impl ItemState {
@@ -18,7 +23,24 @@ impl ItemState {
             ItemState::Deleted => "deleted",
             ItemState::Skipped => "skipped",
             ItemState::Failed => "failed",
+            ItemState::Undeletable => "undeletable",
         }
+    }
+}
+
+pub(crate) fn reach_as_str(reach: DeleteReach) -> &'static str {
+    match reach {
+        DeleteReach::Everyone => "everyone",
+        DeleteReach::OnlyForSelf => "only_for_self",
+        DeleteReach::Nowhere => "nowhere",
+    }
+}
+
+pub(crate) fn reach_from_stored(stored: &str) -> DeleteReach {
+    match stored {
+        "only_for_self" => DeleteReach::OnlyForSelf,
+        "nowhere" => DeleteReach::Nowhere,
+        _ => DeleteReach::Everyone,
     }
 }
 
