@@ -71,6 +71,8 @@ pub struct PreviewCounts {
     pub skipped: u64,
     pub failed: u64,
     pub undeletable: u64,
+    /// Of `protected`, what only this account would have stopped seeing.
+    pub protected_only_for_self: u64,
 }
 
 /// One preview row as a UI lists it: what will go, what was protected, or what the
@@ -238,17 +240,23 @@ impl Store {
     pub fn preview_counts(&self, run_id: &str) -> Result<PreviewCounts> {
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT state, COUNT(*) FROM items WHERE run_id = ?1 GROUP BY state")?;
+            .prepare_cached(&format!(
+                "SELECT state, COUNT(*), SUM({}) FROM items WHERE run_id = ?1 GROUP BY state",
+                pending::ONLY_FOR_SELF
+            ))?;
         let rows = stmt.query_map(params![run_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
         })?;
         let mut c = PreviewCounts::default();
         for row in rows {
-            let (state, n) = row?;
+            let (state, n, only_for_self) = row?;
             let n = n as u64;
             match state.as_str() {
                 "pending" => c.pending = n,
-                "protected" => c.protected = n,
+                "protected" => {
+                    c.protected = n;
+                    c.protected_only_for_self = only_for_self as u64;
+                }
                 "deleted" => c.deleted = n,
                 "skipped" => c.skipped = n,
                 "failed" => c.failed = n,

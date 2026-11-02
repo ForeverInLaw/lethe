@@ -73,25 +73,24 @@ impl Store {
     /// Keeps the rows the backup cannot hold in full, for a person who did not agree
     /// to losing part of them.
     pub fn protect_backup_gaps(&self, run_id: &str) -> Result<()> {
-        self.protect_pending(run_id, BACKUP_GAP)?;
-        Ok(())
+        self.protect_pending(run_id, BACKUP_GAP)
     }
 
     /// Keeps the rows only this account would stop seeing, for a person who did not
-    /// agree to leave them with everyone else. Returns how many it kept.
-    pub fn protect_only_for_self(&self, run_id: &str) -> Result<u64> {
+    /// agree to leave them with everyone else.
+    pub fn protect_only_for_self(&self, run_id: &str) -> Result<()> {
         self.protect_pending(run_id, ONLY_FOR_SELF)
     }
 
-    fn protect_pending(&self, run_id: &str, which: &str) -> Result<u64> {
-        let kept = self.conn.execute(
+    fn protect_pending(&self, run_id: &str, which: &str) -> Result<()> {
+        self.conn.execute(
             &format!(
                 "UPDATE items SET state = ?1
                  WHERE items.run_id = ?2 AND items.state = 'pending' AND {which}"
             ),
             params![ItemState::Protected.as_str(), run_id],
         )?;
-        Ok(kept as u64)
+        Ok(())
     }
 }
 

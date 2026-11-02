@@ -61,7 +61,8 @@ pub struct RunOutcome {
     pub deleted_only_for_self: u64,
     pub skipped: u64,
     pub failed: u64,
-    /// Items that only this account would have stopped seeing, kept for want of consent.
+    /// Items that only this account would have stopped seeing and that stayed: for
+    /// want of consent, or protected by the person.
     pub kept_only_for_self: u64,
     /// Items in the set the platform does not let this account delete.
     pub undeletable: u64,
@@ -200,12 +201,11 @@ pub async fn execute(
         (Some(target), true) => Some(ArchiveWriter::create(target, req)?),
         _ => None,
     };
-    // Before the backup gaps, so every item kept for this reason is counted.
-    if !req.allow_only_for_self {
-        outcome.kept_only_for_self = store.protect_only_for_self(&req.run_id)?;
-    }
     if !req.allow_incomplete_backup {
         store.protect_backup_gaps(&req.run_id)?;
+    }
+    if !req.allow_only_for_self {
+        store.protect_only_for_self(&req.run_id)?;
     }
 
     // From here on the preview is final: `set_item_protected` refuses, and every
@@ -213,6 +213,8 @@ pub async fn execute(
     store.set_run_state(&req.run_id, RunState::Executing)?;
     let counts = store.preview_counts(&req.run_id)?;
     let total = counts.pending;
+    // Read from the store, so a run resumed after a stop still counts them.
+    outcome.kept_only_for_self = counts.protected_only_for_self;
     outcome.undeletable = counts.undeletable;
     let _ = progress.send(ProgressEvent::Deleting { deleted: 0, skipped: 0, failed: 0, total });
 
