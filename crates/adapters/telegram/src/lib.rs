@@ -87,16 +87,14 @@ pub struct DeletePlan {
 }
 
 impl DeletePlan {
-    /// `current` holds what `items` allow right now, in the same order.
+    /// `checked` pairs each item with what it allows right now.
     pub fn new(
-        items: &[ItemRef],
-        current: Vec<Result<DeleteRights, AdapterError>>,
+        checked: Vec<(&ItemRef, Result<DeleteRights, AdapterError>)>,
         current_user_id: i64,
     ) -> Self {
         let mut calls: HashMap<DeleteCall, Vec<i64>> = HashMap::new();
-        let slots = items
-            .iter()
-            .zip(current)
+        let slots = checked
+            .into_iter()
             .map(|(item, rights)| {
                 let rights = rights.map_err(|error| outcome_for(&Err(error)))?;
                 let (chat_id, message_id) = parse_message_ref(item).ok_or_else(|| Outcome::Failed {
@@ -246,6 +244,10 @@ mod delete_mapping_tests {
         )
     }
 
+    fn planned(items: &[ItemRef], current: Vec<Result<DeleteRights, AdapterError>>) -> DeletePlan {
+        DeletePlan::new(items.iter().zip(current).collect(), ME)
+    }
+
     fn all_succeed(plan: &DeletePlan) -> HashMap<DeleteCall, Result<(), AdapterError>> {
         plan.calls.keys().map(|call| (*call, Ok(()))).collect()
     }
@@ -268,7 +270,7 @@ mod delete_mapping_tests {
     fn a_saved_message_goes_without_revoke_though_it_reads_as_everyone() {
         let items = [message(ME, 1, DeleteReach::Everyone)];
 
-        let plan = DeletePlan::new(&items, vec![Ok(ONLY_FOR_SELF)], ME);
+        let plan = planned(&items, vec![Ok(ONLY_FOR_SELF)]);
 
         assert_eq!(plan.calls[&DeleteCall { chat_id: ME, revoke: false }], [1]);
     }
@@ -289,7 +291,7 @@ mod delete_mapping_tests {
             message(7, 3, DeleteReach::Everyone),
         ];
 
-        let plan = DeletePlan::new(&items, vec![Ok(FOR_EVERYONE), Ok(ONLY_FOR_SELF), Ok(FOR_EVERYONE)], ME);
+        let plan = planned(&items, vec![Ok(FOR_EVERYONE), Ok(ONLY_FOR_SELF), Ok(FOR_EVERYONE)]);
 
         assert_eq!(plan.calls[&DeleteCall { chat_id: 7, revoke: true }], [1, 3]);
         assert_eq!(plan.calls[&DeleteCall { chat_id: 7, revoke: false }], [2]);
@@ -301,7 +303,7 @@ mod delete_mapping_tests {
     fn a_message_that_can_no_longer_go_for_everyone_stays_and_the_rest_still_go() {
         let items = [message(7, 1, DeleteReach::Everyone), message(7, 2, DeleteReach::Everyone)];
 
-        let plan = DeletePlan::new(&items, vec![Ok(ONLY_FOR_SELF), Ok(FOR_EVERYONE)], ME);
+        let plan = planned(&items, vec![Ok(ONLY_FOR_SELF), Ok(FOR_EVERYONE)]);
 
         assert_eq!(plan.calls.len(), 1);
         assert_eq!(plan.calls[&DeleteCall { chat_id: 7, revoke: true }], [2]);
@@ -314,7 +316,7 @@ mod delete_mapping_tests {
     fn a_message_telegram_will_not_delete_does_not_sink_its_batch() {
         let items = [message(7, 1, DeleteReach::Everyone), message(7, 2, DeleteReach::Everyone)];
 
-        let plan = DeletePlan::new(&items, vec![Ok(NEITHER), Ok(FOR_EVERYONE)], ME);
+        let plan = planned(&items, vec![Ok(NEITHER), Ok(FOR_EVERYONE)]);
 
         let outcomes = plan.outcomes(&all_succeed(&plan));
         assert!(matches!(outcomes[0], Outcome::Failed { .. }));
@@ -336,7 +338,7 @@ mod delete_mapping_tests {
             Ok(ONLY_FOR_SELF),
         ];
 
-        let plan = DeletePlan::new(&items, current, ME);
+        let plan = planned(&items, current);
         let mut results = all_succeed(&plan);
         results.insert(
             DeleteCall { chat_id: 2, revoke: true },
@@ -355,7 +357,7 @@ mod delete_mapping_tests {
     fn a_message_already_gone_when_checked_counts_as_skipped() {
         let items = [message(5, 1, DeleteReach::Everyone)];
 
-        let plan = DeletePlan::new(&items, vec![Err(AdapterError::NotFound)], ME);
+        let plan = planned(&items, vec![Err(AdapterError::NotFound)]);
 
         assert!(plan.calls.is_empty());
         assert!(matches!(plan.outcomes(&HashMap::new())[0], Outcome::Skipped { .. }));
@@ -364,7 +366,7 @@ mod delete_mapping_tests {
     #[test]
     fn a_call_that_finds_the_messages_gone_counts_them_as_skipped() {
         let items = [message(5, 1, DeleteReach::Everyone)];
-        let plan = DeletePlan::new(&items, vec![Ok(FOR_EVERYONE)], ME);
+        let plan = planned(&items, vec![Ok(FOR_EVERYONE)]);
         let results = HashMap::from([(DeleteCall { chat_id: 5, revoke: true }, Err(AdapterError::NotFound))]);
 
         assert!(matches!(plan.outcomes(&results)[0], Outcome::Skipped { .. }));
