@@ -150,6 +150,16 @@ impl Store {
         Ok(())
     }
 
+    /// Dates the run by the moment it begins deleting. It was created at the preview,
+    /// which can be long before.
+    pub fn set_run_started(&self, run_id: &str, started_secs: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET started = ?1 WHERE run_id = ?2",
+            params![started_secs, run_id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_run_state(&self, run_id: &str, state: RunState) -> Result<()> {
         self.conn.execute(
             "UPDATE runs SET state = ?1 WHERE run_id = ?2",
@@ -753,6 +763,17 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_run_is_dated_by_when_it_began_deleting_not_by_its_preview() {
+        let s = Store::open_in_memory("k").unwrap();
+        s.create_run(&NewRun { started_secs: 1, ..run("r") }).unwrap();
+        s.set_run_state("r", RunState::Executing).unwrap();
+
+        s.set_run_started("r", 9).unwrap();
+
+        assert_eq!(s.runs_without_receipt().unwrap()[0].started_secs, 9);
     }
 
     #[test]
