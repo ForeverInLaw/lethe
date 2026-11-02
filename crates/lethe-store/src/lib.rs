@@ -151,6 +151,7 @@ impl Store {
         conn.pragma_update(None, "secure_delete", true)?;
         conn.execute_batch(include_str!("schema.sql"))?;
         migrate_content_columns(&conn)?;
+        retention::forget_what_older_versions_kept(&conn)?;
         Ok(Self { conn })
     }
 

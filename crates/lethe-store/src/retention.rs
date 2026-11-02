@@ -3,7 +3,7 @@
 
 use rusqlite::{params, Connection};
 
-use crate::unsaved_files::WAITS_ON_A_FILE;
+use crate::unsaved_files::{self, WAITS_ON_A_FILE};
 use crate::{Result, Store};
 
 impl Store {
@@ -17,31 +17,31 @@ impl Store {
             "DELETE FROM runs WHERE state IN ('enumerating', 'preview')",
             [],
         )?;
-        // A later run now drops these copies when it gets to the item; older versions kept them.
-        tx.execute(
-            "DELETE FROM items WHERE file_failure IS NOT NULL AND EXISTS (
-                SELECT 1 FROM runs this
-                JOIN runs later ON later.rowid > this.rowid
-                    AND later.platform = this.platform AND later.account = this.account
-                JOIN items settled ON settled.run_id = later.run_id AND settled.platform_id = items.platform_id
-                WHERE this.run_id = items.run_id AND settled.state IN ('deleted', 'skipped', 'failed')
-             )",
-            [],
-        )?;
-        drop_receipted_rows(&tx, None)?;
         tx.execute(
             &format!("DELETE FROM items WHERE state != 'deleted' AND NOT ({WAITS_ON_A_FILE})"),
-            [],
-        )?;
-        // Older versions kept the content of what they deleted.
-        tx.execute(
-            "UPDATE items SET text = NULL, media_json = '[]', platform_record = NULL
-             WHERE state = 'deleted'",
             [],
         )?;
         tx.commit()?;
         Ok(())
     }
+}
+
+/// Drops what older versions kept and this one forgets as it goes. Safe at any
+/// time, so it runs whenever the store opens.
+pub(crate) fn forget_what_older_versions_kept(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    // Before the receipts drop their rows: a later run's rows tell which copies are done.
+    unsaved_files::drop_copies_older_versions_kept(&tx)?;
+    drop_receipted_rows(&tx, None)?;
+    tx.execute(
+        &format!(
+            "UPDATE items SET text = NULL, media_json = '[]', platform_record = NULL
+             WHERE state IN ('deleted', 'skipped', 'failed') AND NOT ({WAITS_ON_A_FILE})"
+        ),
+        [],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Drops what runs with a receipt no longer need: every item but those still
@@ -95,7 +95,7 @@ mod tests {
 
     /// Run `run_id`, stopped with one item per way an item ends up: deleted, kept,
     /// stayed for want of a file, and not reached.
-    fn ran(store: &mut Store, run_id: &str) {
+    fn run_with_every_outcome(store: &mut Store, run_id: &str) {
         new_run(store, run_id, RunState::Executing);
         store
             .snapshot_items(
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn a_receipt_leaves_only_the_items_still_waiting_on_a_file() {
         let mut store = Store::open_in_memory("k").unwrap();
-        ran(&mut store, "r");
+        run_with_every_outcome(&mut store, "r");
 
         store.save_receipt("r", "{}", "pub", "sig").unwrap();
 
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn an_interrupted_run_keeps_only_the_count_of_what_it_deleted_and_what_waits_on_a_file() {
         let mut store = Store::open_in_memory("k").unwrap();
-        ran(&mut store, "r");
+        run_with_every_outcome(&mut store, "r");
 
         store.forget_stale_runs().unwrap();
 
@@ -191,27 +191,38 @@ mod tests {
     }
 
     #[test]
-    fn what_an_older_version_left_behind_is_forgotten_too() {
-        let mut store = Store::open_in_memory("k").unwrap();
-        ran(&mut store, "first");
-        ran(&mut store, "second");
-        // As an older version left them: text kept after the delete, a receipt that
-        // dropped nothing, and the first run's copy of an item the second one got to.
-        store
-            .conn
-            .execute_batch(
-                "UPDATE items SET text = 'still here' WHERE run_id = 'first' AND platform_id = 'gone';
-                 INSERT INTO receipts (run_id, summary_json, public_key_hex, signature_hex)
-                 VALUES ('second', '{}', 'pub', 'sig');
-                 INSERT INTO items (run_id, platform_id, content_type, state, file_failure)
-                 VALUES ('first', 'photo', 'post', 'failed', 'unavailable');",
-            )
-            .unwrap();
+    fn what_an_older_version_left_behind_is_forgotten_when_the_store_opens() {
+        let path = std::env::temp_dir().join(format!("lethe-retention-{}", std::process::id()));
+        let path = path.to_str().unwrap();
+        {
+            let mut store = Store::open(path, "k").unwrap();
+            run_with_every_outcome(&mut store, "first");
+            run_with_every_outcome(&mut store, "second");
+            // As an older version left them: text kept after the delete, a receipt that
+            // dropped nothing, and the first run's copy of an item the second one got to.
+            store
+                .conn
+                .execute_batch(
+                    "UPDATE items SET text = 'still here' WHERE run_id = 'first' AND platform_id = 'gone';
+                     INSERT INTO receipts (run_id, summary_json, public_key_hex, signature_hex)
+                     VALUES ('second', '{}', 'pub', 'sig');
+                     INSERT INTO items (run_id, platform_id, content_type, state, file_failure)
+                     VALUES ('first', 'photo', 'post', 'failed', 'unavailable');",
+                )
+                .unwrap();
+        }
 
-        store.forget_stale_runs().unwrap();
+        let store = Store::open(path, "k").unwrap();
+        let (first, second) = (rows_of(&store, "first"), rows_of(&store, "second"));
+        let gone = text_of(&store, "first", "gone");
+        std::fs::remove_file(path).unwrap();
 
-        assert_eq!(rows_of(&store, "first"), ["gone"]);
-        assert_eq!(text_of(&store, "first", "gone"), None);
-        assert_eq!(rows_of(&store, "second"), ["photo"]);
+        assert_eq!(
+            first,
+            ["gone", "kept", "left"],
+            "the second run holds the photo now"
+        );
+        assert_eq!(gone, None);
+        assert_eq!(second, ["photo"]);
     }
 }

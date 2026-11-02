@@ -132,19 +132,35 @@ impl Store {
     }
 }
 
+/// The earlier runs of the same account as run `this`.
+const EARLIER_RUNS: &str = "SELECT earlier.run_id FROM runs this
+    JOIN runs earlier ON earlier.rowid < this.rowid
+        AND earlier.platform = this.platform AND earlier.account = this.account";
+
 /// Once run `run_id` has dealt with an item, the earlier runs of the account that
 /// kept it for want of a file no longer need their row of it.
 pub(crate) fn drop_earlier_copies(conn: &Connection, run_id: &str, platform_id: &str) -> Result<()> {
-    conn.prepare_cached(
-        "DELETE FROM items
-         WHERE platform_id = ?2 AND file_failure IS NOT NULL AND run_id IN (
-            SELECT earlier.run_id FROM runs this
-            JOIN runs earlier ON earlier.rowid < this.rowid
-                AND earlier.platform = this.platform AND earlier.account = this.account
-            WHERE this.run_id = ?1
-         )",
-    )?
+    conn.prepare_cached(&format!(
+        "DELETE FROM items WHERE platform_id = ?2 AND file_failure IS NOT NULL
+           AND run_id IN ({EARLIER_RUNS} WHERE this.run_id = ?1)"
+    ))?
     .execute(params![run_id, platform_id])?;
+    Ok(())
+}
+
+/// The same copies, for every item a later run already dealt with: older versions
+/// kept them.
+pub(crate) fn drop_copies_older_versions_kept(conn: &Connection) -> Result<()> {
+    conn.execute(
+        &format!(
+            "DELETE FROM items WHERE file_failure IS NOT NULL AND run_id IN (
+                {EARLIER_RUNS}
+                JOIN items settled ON settled.run_id = this.run_id AND settled.platform_id = items.platform_id
+                WHERE settled.state IN ('deleted', 'skipped', 'failed')
+             )"
+        ),
+        [],
+    )?;
     Ok(())
 }
 
