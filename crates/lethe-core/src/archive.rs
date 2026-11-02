@@ -5,8 +5,9 @@
 //! per item: record JSON, then the chunks of each file in `media` order
 //! ```
 //!
-//! A record states how many chunks and bytes follow for each file, so a reader
-//! can walk the archive and tell records from file contents.
+//! A record states how many chunks and bytes follow for each stored file, so a
+//! reader can walk the archive and tell records from file contents. A file that
+//! could not be saved states neither, and nothing of it follows.
 
 mod export;
 
@@ -53,8 +54,26 @@ struct ItemRecord<'a> {
 struct MediaRecord<'a> {
     #[serde(flatten)]
     source: &'a MediaRef,
+    #[serde(flatten)]
+    stored: Option<StoredFile>,
+}
+
+/// How much of a file follows its record. A file that could not be saved has none,
+/// and neither does any file in an archive from before contents were stored; an
+/// empty file has one with no chunks.
+#[derive(Serialize)]
+struct StoredFile {
     archived_bytes: u64,
     chunks: u64,
+}
+
+impl StoredFile {
+    fn of_size(bytes: u64) -> Self {
+        Self {
+            archived_bytes: bytes,
+            chunks: bytes.div_ceil(MEDIA_CHUNK_BYTES as u64),
+        }
+    }
 }
 
 fn to_json(value: &impl Serialize) -> Result<Vec<u8>> {
@@ -91,11 +110,12 @@ impl ArchiveWriter {
     ) -> Result<()> {
         let sizes = files
             .iter()
-            .map(|file| match file {
-                Some(file) => Ok(std::fs::metadata(&file.path).map_err(io_error)?.len()),
-                None => Ok(0),
+            .map(|file| {
+                file.as_ref()
+                    .map(|file| Ok(std::fs::metadata(&file.path).map_err(io_error)?.len()))
+                    .transpose()
             })
-            .collect::<Result<Vec<u64>>>()?;
+            .collect::<Result<Vec<Option<u64>>>>()?;
         let backup_gap = item
             .backup_gap
             .iter()
@@ -115,8 +135,7 @@ impl ArchiveWriter {
                 .zip(&sizes)
                 .map(|(source, size)| MediaRecord {
                     source,
-                    archived_bytes: *size,
-                    chunks: size.div_ceil(MEDIA_CHUNK_BYTES as u64),
+                    stored: size.map(StoredFile::of_size),
                 })
                 .collect(),
             platform_record: item.platform_record.as_ref(),
@@ -124,7 +143,7 @@ impl ArchiveWriter {
         };
         self.container.write_chunk(&to_json(&record)?)?;
         for (file, size) in files.iter().zip(sizes) {
-            if let Some(file) = file {
+            if let (Some(file), Some(size)) = (file, size) {
                 self.write_file(file, size)?;
             }
         }
@@ -177,16 +196,39 @@ struct ReadRecord {
     media: Vec<ReadMedia>,
 }
 
-/// Archives from before file contents were stored carry no `archived_bytes` or
-/// `chunks`, so such a file has nothing to read.
 #[derive(Deserialize)]
+#[serde(try_from = "MediaFields")]
 struct ReadMedia {
     mime: Option<String>,
     file_name: Option<String>,
-    #[serde(default)]
-    archived_bytes: u64,
-    #[serde(default)]
-    chunks: u64,
+    stored: Option<StoredFile>,
+}
+
+/// A media entry as written. A record that states only one of the two sizes is
+/// damaged, not a file that was never stored.
+#[derive(Deserialize)]
+struct MediaFields {
+    mime: Option<String>,
+    file_name: Option<String>,
+    archived_bytes: Option<u64>,
+    chunks: Option<u64>,
+}
+
+impl TryFrom<MediaFields> for ReadMedia {
+    type Error = &'static str;
+
+    fn try_from(fields: MediaFields) -> std::result::Result<Self, Self::Error> {
+        let stored = match (fields.archived_bytes, fields.chunks) {
+            (Some(archived_bytes), Some(chunks)) => Some(StoredFile { archived_bytes, chunks }),
+            (None, None) => None,
+            _ => return Err("a file states only part of its size"),
+        };
+        Ok(Self {
+            mime: fields.mime,
+            file_name: fields.file_name,
+            stored,
+        })
+    }
 }
 
 /// Why a file could not be copied out of the archive. Only the first case means
@@ -228,9 +270,9 @@ impl<R: Read> ArchiveWalk<R> {
     }
 
     /// Copies the file that comes next in the archive, one chunk at a time.
-    fn copy_file(&mut self, media: &ReadMedia, out: &mut impl Write) -> std::result::Result<(), CopyFailure> {
+    fn copy_file(&mut self, stored: &StoredFile, out: &mut impl Write) -> std::result::Result<(), CopyFailure> {
         let mut bytes = 0;
-        for _ in 0..media.chunks {
+        for _ in 0..stored.chunks {
             let chunk = self
                 .reader
                 .read_chunk()
@@ -239,7 +281,7 @@ impl<R: Read> ArchiveWalk<R> {
             out.write_all(&chunk).map_err(CopyFailure::Output)?;
             bytes += chunk.len() as u64;
         }
-        if bytes != media.archived_bytes {
+        if bytes != stored.archived_bytes {
             return Err(CopyFailure::Archive(corrupt("a file does not match its record")));
         }
         Ok(())
@@ -253,9 +295,9 @@ pub fn audit_archive<R: Read>(source: R, key: &DataKey) -> Result<ArchiveAudit> 
     let mut audit = ArchiveAudit::default();
     while let Some((record, _)) = walk.next_record()? {
         audit.items += 1;
-        for media in &record.media {
-            walk.copy_file(media, &mut io::sink())?;
-            audit.media_files += u64::from(media.chunks > 0);
+        for stored in record.media.iter().filter_map(|media| media.stored.as_ref()) {
+            walk.copy_file(stored, &mut io::sink())?;
+            audit.media_files += 1;
         }
     }
     Ok(audit)
@@ -322,6 +364,21 @@ mod tests {
                 media_files: 0
             }
         );
+    }
+
+    #[test]
+    fn audit_counts_an_empty_file_and_skips_one_that_was_not_saved() {
+        let buf = archive(&[
+            b"{}",
+            br#"{"media":[{"archived_bytes":0,"chunks":0},{"url":"lost"}]}"#,
+        ]);
+        assert_eq!(audit_archive(buf.as_slice(), &KEY).unwrap().media_files, 1);
+    }
+
+    #[test]
+    fn audit_rejects_a_file_that_states_only_part_of_its_size() {
+        let buf = archive(&[b"{}", br#"{"media":[{"archived_bytes":3}]}"#]);
+        assert!(audit_archive(buf.as_slice(), &KEY).is_err());
     }
 
     #[test]
