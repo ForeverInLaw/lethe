@@ -27,7 +27,8 @@ CREATE TABLE IF NOT EXISTS items (
     platform_record TEXT,            -- the item as the platform returned it, until it ran
     backup_gap   TEXT,               -- why the backup cannot hold all of it
     file_failure TEXT,               -- unavailable | unreachable: its file was not saved, so it stayed
-    state        TEXT    NOT NULL,   -- pending | protected | deleted | skipped | failed
+    delete_reach TEXT    NOT NULL DEFAULT 'everyone', -- everyone | only_for_self | nowhere
+    state        TEXT    NOT NULL,   -- pending | protected | deleted | skipped | failed | undeletable
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_error   TEXT,
     PRIMARY KEY (run_id, platform_id)

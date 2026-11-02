@@ -25,8 +25,16 @@ pub struct RunSummary {
     pub started_epoch_secs: u64,
     pub finished_epoch_secs: u64,
     pub deleted: u64,
+    /// How many of `deleted` other people can still see. Left out when none, so
+    /// receipts signed before this field existed keep their exact signed bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub deleted_only_for_self: u64,
     pub skipped: u64,
     pub failed: u64,
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +128,7 @@ mod tests {
             started_epoch_secs: 1_000,
             finished_epoch_secs: 1_042,
             deleted: 37,
+            deleted_only_for_self: 0,
             skipped: 2,
             failed: 1,
         }
@@ -137,6 +146,34 @@ mod tests {
         let signer = ReceiptSigner::generate();
         let mut receipt = signer.sign(&summary()).unwrap();
         receipt.summary.deleted += 1; // lie about the count
+        assert!(matches!(verify(&receipt), Err(CryptoError::BadSignature)));
+    }
+
+    #[test]
+    fn a_receipt_signed_before_the_field_existed_still_verifies() {
+        let signer = ReceiptSigner::generate();
+        let signed = r#"{"run_id":"run-1","platform":"bluesky","account_label":"alice","started_epoch_secs":1000,"finished_epoch_secs":1042,"deleted":37,"skipped":2,"failed":1}"#;
+        let mut signature = [0u8; SIGNATURE_LEN];
+        crypto_sign_detached(&mut signature, signed.as_bytes(), &signer.secret_key).unwrap();
+        let receipt = SignedReceipt {
+            summary: serde_json::from_str(signed).unwrap(),
+            public_key_hex: signer.public_key_hex(),
+            signature_hex: to_hex(&signature),
+        };
+
+        assert!(verify(&receipt).is_ok());
+    }
+
+    #[test]
+    fn what_stayed_visible_to_others_cannot_be_edited_out_of_a_receipt() {
+        let signer = ReceiptSigner::generate();
+        let mut receipt = signer
+            .sign(&RunSummary { deleted_only_for_self: 5, ..summary() })
+            .unwrap();
+        assert!(verify(&receipt).is_ok());
+
+        receipt.summary.deleted_only_for_self = 0;
+
         assert!(matches!(verify(&receipt), Err(CryptoError::BadSignature)));
     }
 

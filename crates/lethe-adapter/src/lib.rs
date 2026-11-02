@@ -233,7 +233,21 @@ pub struct Item {
     /// Why the backup cannot hold all of this item, when the scan already knows.
     /// Such an item is deleted only if the person agrees to that.
     pub backup_gap: Option<String>,
+    /// Who stops seeing this item once it is deleted, as far as the scan can tell.
+    pub delete_reach: DeleteReach,
     pub item_ref: ItemRef,
+}
+
+/// How far a delete of one item goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteReach {
+    /// The item is gone for everyone who could see it.
+    Everyone,
+    /// Only this account stops seeing it; everyone else still does. Such an item is
+    /// deleted only if the person agrees to that.
+    OnlyForSelf,
+    /// The platform does not let this account delete it.
+    Nowhere,
 }
 
 // ---------------------------------------------------------------------------

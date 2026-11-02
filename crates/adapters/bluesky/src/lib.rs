@@ -20,7 +20,7 @@ use atrium_api::types::string::{AtIdentifier, Cid, Did, Nsid, RecordKey};
 use atrium_api::types::{BlobRef, TryFromUnknown, TypedBlobRef, Unknown};
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use lethe_adapter::{
-    AdapterError, AuthProvider, Capabilities, Consent, ContentType, Credential, Descriptor,
+    AdapterError, AuthProvider, Capabilities, Consent, ContentType, Credential, DeleteReach, Descriptor,
     Engagement, EnumeratePlan, FetchedMedia, Item, ItemRef, ItemStream, MediaRef, Outcome,
     PlatformAdapter, PlatformRecord, PushdownDim,
     RatePolicy, Result, RiskClass, SecretBlob,
@@ -355,6 +355,7 @@ fn record_to_item(
         backup_gap: files
             .has_unreadable_blob
             .then(|| "a file in this post has a reference that cannot be read".to_owned()),
+        delete_reach: DeleteReach::Everyone,
         item_ref: ItemRef {
             platform_id: rec.uri.clone(),
             token: Some(format!("{collection}:{rkey}")),

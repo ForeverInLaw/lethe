@@ -4,8 +4,10 @@
 //! native TDLib. Use `tdlib-docs` with `cargo check` to type-check generated
 //! TDLib bindings; test binaries still need native tdjson symbols.
 
-use lethe_adapter::{AdapterError, FetchedMedia, MediaRef, PlatformRecord};
+use lethe_adapter::{AdapterError, DeleteReach, FetchedMedia, MediaRef, PlatformRecord};
 use tdlib_rs::{enums, functions, types};
+
+use crate::DeleteRights;
 
 const CHAT_LOAD_PAGE: i32 = 100;
 const MAX_CHATS: i32 = 100_000;
@@ -82,6 +84,8 @@ pub struct TelegramMessageRef {
     pub platform_record: PlatformRecord,
     /// What TDLib does not hand over, so the backup cannot hold it.
     pub backup_gap: Option<String>,
+    /// How far deleting this message goes, as Telegram says for this account.
+    pub delete_reach: DeleteReach,
 }
 
 /// One page of the user's own messages in a chat, newest first.
@@ -166,19 +170,51 @@ pub async fn search_own_messages(
     .map_err(map_tdlib_error)?;
 
     let enums::FoundChatMessages::FoundChatMessages(found) = found;
+    let mut messages = Vec::with_capacity(found.messages.len());
+    for message in found.messages.iter().filter(|message| is_from_user(message, current_user_id)) {
+        match read_delete_rights(client_id, chat_id, message.id).await {
+            Ok(rights) => messages.push(message_ref(message, rights.reach(chat_id, current_user_id))?),
+            // Deleted since the search found it, so there is nothing left to clean.
+            Err(AdapterError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(OwnMessagePage {
         next_from_message_id: found.next_from_message_id,
         total_count: found.total_count,
-        messages: found
-            .messages
-            .into_iter()
-            .filter(|message| is_from_user(message, current_user_id))
-            .map(|message| message_ref(&message))
-            .collect::<Result<_, _>>()?,
+        messages,
     })
 }
 
-fn message_ref(message: &types::Message) -> Result<TelegramMessageRef, AdapterError> {
+/// What Telegram lets this account do with a message right now. An offline call that
+/// only knows loaded messages, so one that is not loaded, as after a restart, is
+/// fetched first. `NotFound` means the message is gone.
+pub async fn read_delete_rights(
+    client_id: TdlibClientId,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<DeleteRights, AdapterError> {
+    let properties = match functions::get_message_properties(chat_id, message_id, client_id.raw()).await {
+        Err(error) if is_message_not_loaded(&error) => {
+            functions::get_message(chat_id, message_id, client_id.raw())
+                .await
+                .map_err(map_tdlib_error)?;
+            functions::get_message_properties(chat_id, message_id, client_id.raw()).await
+        }
+        other => other,
+    };
+    let enums::MessageProperties::MessageProperties(properties) = properties.map_err(map_tdlib_error)?;
+    Ok(DeleteRights {
+        for_everyone: properties.can_be_deleted_for_all_users,
+        for_self: properties.can_be_deleted_only_for_self,
+    })
+}
+
+fn is_message_not_loaded(error: &types::Error) -> bool {
+    error.code == 404 || error.message == "Message not found"
+}
+
+fn message_ref(message: &types::Message, delete_reach: DeleteReach) -> Result<TelegramMessageRef, AdapterError> {
     Ok(TelegramMessageRef {
         chat_id: message.chat_id,
         message_id: message.id,
@@ -191,6 +227,7 @@ fn message_ref(message: &types::Message) -> Result<TelegramMessageRef, AdapterEr
             .collect(),
         platform_record: PlatformRecord::capture(message)?,
         backup_gap: backup_gap(&message.content).map(str::to_owned),
+        delete_reach,
     })
 }
 
@@ -668,12 +705,12 @@ mod tests {
     }
 
     fn record_of(content: enums::MessageContent) -> serde_json::Value {
-        let message = message_ref(&message_with(content)).unwrap();
+        let message = message_ref(&message_with(content), DeleteReach::Everyone).unwrap();
         serde_json::from_str(message.platform_record.as_json()).unwrap()
     }
 
     fn gap_of(content: enums::MessageContent) -> Option<String> {
-        message_ref(&message_with(content)).unwrap().backup_gap
+        message_ref(&message_with(content), DeleteReach::Everyone).unwrap().backup_gap
     }
 
     #[test]

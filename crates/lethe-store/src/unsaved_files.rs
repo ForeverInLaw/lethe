@@ -120,9 +120,9 @@ impl Store {
         let items = tx.execute(
             &format!(
                 "INSERT INTO items (run_id, platform_id, content_type, created_at, token, text, media_json,
-                                    platform_record, backup_gap, state)
+                                    platform_record, backup_gap, delete_reach, state)
                  SELECT ?2, platform_id, content_type, created_at, token, text, media_json,
-                        platform_record, backup_gap, ?3 FROM items WHERE {STILL_UNSAVED}"
+                        platform_record, backup_gap, delete_reach, ?3 FROM items WHERE {STILL_UNSAVED}"
             ),
             params![from_run_id, new_run_id, ItemState::Pending.as_str()],
         )?;
@@ -190,6 +190,7 @@ mod tests {
                 }],
                 platform_record: Some(PlatformRecord::from_json(format!("{{\"id\":\"{id}\"}}")).unwrap()),
                 backup_gap: Some("poll votes are missing".into()),
+                delete_reach: lethe_adapter::DeleteReach::Everyone,
                 state: ItemState::Pending,
             })
             .collect();

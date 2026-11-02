@@ -22,7 +22,7 @@ async fn a_network_blip_is_waited_out_before_the_item_counts_as_stuck() {
 
     let run = run_media(adapter.clone(), RunControl::new()).await;
 
-    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
     assert_eq!(run.audit().media_files, 1);
     assert_eq!(adapter.journal(), ["fetch photo", "fetch photo", "fetch photo", "release 1", "delete m"]);
 }
@@ -35,7 +35,7 @@ async fn a_lasting_network_problem_keeps_the_item_after_the_last_retry() {
 
     let run = run_media(adapter.clone(), RunControl::new()).await;
 
-    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1 });
+    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1, ..Default::default() });
     assert_eq!(adapter.journal(), ["fetch photo"; 4]);
 }
 
@@ -47,7 +47,7 @@ async fn a_file_the_platform_refuses_is_not_retried() {
 
     let run = run_media(adapter.clone(), RunControl::new()).await;
 
-    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1 });
+    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1, ..Default::default() });
     assert_eq!(adapter.journal(), ["fetch photo"]);
 }
 
@@ -82,7 +82,7 @@ async fn with_consent_a_lost_file_no_longer_keeps_its_item_and_the_backup_says_s
 
     let run = run_media_allowing_lost_files(adapter.clone()).await;
 
-    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
     assert_eq!(adapter.journal(), ["fetch first", "fetch gone", "release 1", "delete album"]);
     assert_eq!(run.audit().items, 1);
     assert_eq!(run.audit().media_files, 1);
@@ -108,7 +108,7 @@ async fn consent_does_not_cover_a_file_that_is_only_out_of_reach() {
 
     let run = run_media_allowing_lost_files(adapter.clone()).await;
 
-    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1 });
+    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1, ..Default::default() });
     assert!(!adapter.journal().contains(&"delete m".to_string()));
     assert_eq!(run.store.unsaved_files("media", 10).unwrap().total, 1);
 }

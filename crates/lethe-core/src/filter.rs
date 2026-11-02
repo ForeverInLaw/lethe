@@ -152,6 +152,7 @@ mod tests {
             media: vec![],
             platform_record: None,
             backup_gap: None,
+            delete_reach: lethe_adapter::DeleteReach::Everyone,
             item_ref: ItemRef { platform_id: "x".into(), token: None },
         }
     }

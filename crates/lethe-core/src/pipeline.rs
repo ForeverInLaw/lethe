@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use lethe_adapter::{AdapterError, EnumeratePlan, FetchedMedia, Item, MediaRef, Outcome, PlatformAdapter};
+use lethe_adapter::{AdapterError, DeleteReach, EnumeratePlan, FetchedMedia, Item, MediaRef, Outcome, PlatformAdapter};
 use lethe_crypto::receipt::{ReceiptSigner, RunSummary, SignedReceipt};
 use lethe_crypto::DataKey;
 use lethe_store::{FileFailure, ItemSnapshot, ItemState, PendingItem, PreviewCounts, RunState, Store};
@@ -39,6 +39,9 @@ pub struct RunRequest {
     /// The person agreed to delete items whose files the platform refuses to hand
     /// over. Any other download error keeps its item regardless.
     pub allow_lost_files: bool,
+    /// The person agreed to delete items that only this account stops seeing. Without
+    /// this, such items stay on the platform.
+    pub allow_only_for_self: bool,
 }
 
 /// Where the encrypted backup is written + the data-key that seals it. The
@@ -54,6 +57,8 @@ pub struct BackupTarget {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunOutcome {
     pub deleted: u64,
+    /// How many of `deleted` other people can still see.
+    pub deleted_only_for_self: u64,
     pub skipped: u64,
     pub failed: u64,
 }
@@ -109,6 +114,10 @@ pub async fn snapshot(
         };
 
         if let Some(state) = state {
+            let state = match item.delete_reach {
+                DeleteReach::Nowhere => ItemState::Undeletable,
+                _ => state,
+            };
             buf.push(ItemSnapshot {
                 item_ref: item.item_ref.clone(),
                 content_type: item.content_type,
@@ -117,6 +126,7 @@ pub async fn snapshot(
                 media: item.media.clone(),
                 platform_record: item.platform_record.clone(),
                 backup_gap: item.backup_gap.clone(),
+                delete_reach: item.delete_reach,
                 state,
             });
         }
@@ -164,6 +174,9 @@ pub async fn execute(
     };
     if !req.allow_incomplete_backup {
         store.protect_backup_gaps(&req.run_id)?;
+    }
+    if !req.allow_only_for_self {
+        store.protect_only_for_self(&req.run_id)?;
     }
 
     // From here on the preview is final: `set_item_protected` refuses, and every
@@ -258,7 +271,12 @@ pub async fn execute(
             // and are retried after the scheduler applies the platform delay.
             for (item, result) in deletable.iter().zip(outcomes) {
                 match &result {
-                    Outcome::Deleted => outcome.deleted += 1,
+                    Outcome::Deleted => {
+                        outcome.deleted += 1;
+                        if item.delete_reach == DeleteReach::OnlyForSelf {
+                            outcome.deleted_only_for_self += 1;
+                        }
+                    }
                     Outcome::Skipped { .. } => outcome.skipped += 1,
                     Outcome::Failed { .. } => outcome.failed += 1,
                     Outcome::RateLimited { retry_after_secs: secs } => {
@@ -407,6 +425,8 @@ async fn archive_item(
 }
 
 #[cfg(test)]
+mod delete_reach_tests;
+#[cfg(test)]
 mod file_failure_tests;
 
 #[cfg(test)]
@@ -469,6 +489,7 @@ mod tests {
                         media: vec![],
                         platform_record: None,
                         backup_gap: None,
+                        delete_reach: DeleteReach::Everyone,
                         item_ref: ItemRef {
                             platform_id: format!("at://fake/app.bsky.feed.post/{i}"),
                             token: Some(format!("app.bsky.feed.post:{i}")),
@@ -524,7 +545,7 @@ mod tests {
         }
     }
 
-    fn match_all_filter() -> FilterSpec {
+    pub(super) fn match_all_filter() -> FilterSpec {
         FilterSpec {
             content_types: Default::default(),
             date_from: None,
@@ -554,6 +575,7 @@ mod tests {
             backup: true,
             allow_incomplete_backup: false,
             allow_lost_files: false,
+            allow_only_for_self: false,
         };
         store
             .create_run(&NewRun {
@@ -583,7 +605,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(outcome, RunOutcome { deleted: n as u64, skipped: 0, failed: 0 });
+        assert_eq!(outcome, RunOutcome { deleted: n as u64, ..Default::default() });
 
         // The encrypted archive decrypts to manifest + one record per item.
         let file = File::open(&path).unwrap();
@@ -624,6 +646,7 @@ mod tests {
             started_epoch_secs: 0,
             finished_epoch_secs: 1,
             deleted: outcome.deleted,
+            deleted_only_for_self: outcome.deleted_only_for_self,
             skipped: outcome.skipped,
             failed: outcome.failed,
         };
@@ -648,6 +671,7 @@ mod tests {
             backup: false,
             allow_incomplete_backup: false,
             allow_lost_files: false,
+            allow_only_for_self: false,
         };
         store
             .create_run(&NewRun {
@@ -674,7 +698,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(outcome, RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
         assert_eq!(store.preview_counts(&req.run_id).unwrap().failed, 0);
 
         let mut saw_throttled = false;
@@ -703,6 +727,7 @@ mod tests {
             backup: false,
             allow_incomplete_backup: false,
             allow_lost_files: false,
+            allow_only_for_self: false,
         };
         store
             .create_run(&NewRun {
@@ -731,7 +756,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(outcome, RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(outcome, RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
         assert!(!store.set_item_protected(&req.run_id, &kept, false).unwrap());
         assert_eq!(store.preview_counts(&req.run_id).unwrap().protected, 1);
     }
@@ -832,6 +857,7 @@ mod tests {
                 .collect(),
             platform_record: None,
             backup_gap: None,
+            delete_reach: DeleteReach::Everyone,
             item_ref: ItemRef { platform_id: id.into(), token: None },
         }
     }
@@ -858,7 +884,12 @@ mod tests {
 
     /// A run in which the person agreed to delete items that lost a file.
     pub(super) async fn run_media_allowing_lost_files(adapter: Arc<MediaAdapter>) -> MediaRun {
-        run_media_request(adapter, RunControl::new(), false, true, true).await
+        run_media_request(adapter, RunControl::new(), false, true, false, true).await
+    }
+
+    /// A run in which the person agreed to delete items only for this account.
+    pub(super) async fn run_media_allowing_only_for_self(adapter: Arc<MediaAdapter>) -> MediaRun {
+        run_media_request(adapter, RunControl::new(), false, false, true, true).await
     }
 
     async fn run_media_with_consent(
@@ -875,7 +906,7 @@ mod tests {
         allow_incomplete_backup: bool,
         with_backup: bool,
     ) -> MediaRun {
-        run_media_request(adapter, control, allow_incomplete_backup, false, with_backup).await
+        run_media_request(adapter, control, allow_incomplete_backup, false, false, with_backup).await
     }
 
     async fn run_media_request(
@@ -883,6 +914,7 @@ mod tests {
         control: RunControl,
         allow_incomplete_backup: bool,
         allow_lost_files: bool,
+        allow_only_for_self: bool,
         with_backup: bool,
     ) -> MediaRun {
         let mut store = Store::open_in_memory("test-key").unwrap();
@@ -897,6 +929,7 @@ mod tests {
             backup: true,
             allow_incomplete_backup,
             allow_lost_files,
+            allow_only_for_self,
         };
         store
             .create_run(&NewRun {
@@ -959,7 +992,7 @@ mod tests {
 
         let run = run_media(adapter.clone(), RunControl::new()).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
         assert_eq!(adapter.journal(), ["fetch photo", "release 1", "delete m1"]);
 
         let chunks = run.chunks();
@@ -990,7 +1023,7 @@ mod tests {
 
         let run = run_media(adapter.clone(), RunControl::new()).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 2, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 2, skipped: 0, failed: 0, ..Default::default() });
         let records: Vec<serde_json::Value> = run.chunks()[1..]
             .iter()
             .map(|chunk| serde_json::from_slice(chunk).unwrap())
@@ -1018,7 +1051,7 @@ mod tests {
 
         let run = run_media(adapter.clone(), RunControl::new()).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
         assert_eq!(adapter.journal(), ["delete whole"]);
         assert_eq!(run.store.preview_counts("media").unwrap().protected, 1);
         assert_eq!(run.audit().items, 1);
@@ -1032,7 +1065,7 @@ mod tests {
 
         let run = run_media_on(adapter.clone(), RunControl::new(), false, false).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 0, ..Default::default() });
         assert!(adapter.journal().is_empty());
     }
 
@@ -1044,7 +1077,7 @@ mod tests {
 
         let run = run_media_with_consent(adapter.clone(), RunControl::new(), true).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
         assert_eq!(adapter.journal(), ["fetch photo", "release 1", "delete gap"]);
         let record: serde_json::Value = serde_json::from_slice(&run.chunks()[1]).unwrap();
         assert_eq!(record["backup_gap"], "Telegram does not hand over this file");
@@ -1063,7 +1096,7 @@ mod tests {
 
         let run = run_media(adapter.clone(), RunControl::new()).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 1 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 1, ..Default::default() });
         assert!(!adapter.journal().contains(&"delete kept".to_string()));
         assert!(adapter.journal().contains(&"delete gone".to_string()));
         assert_eq!(run.store.preview_counts("media").unwrap().failed, 1);
@@ -1096,7 +1129,7 @@ mod tests {
 
         let run = run_media(adapter, RunControl::new()).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 1, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 1, failed: 0, ..Default::default() });
     }
 
     #[tokio::test]
@@ -1111,7 +1144,7 @@ mod tests {
 
         let run = run_media(adapter, RunControl::new()).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
         assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1 });
     }
 
@@ -1125,7 +1158,7 @@ mod tests {
 
         let run = run_media(adapter.clone(), RunControl::new()).await;
 
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
         assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1 });
         assert_eq!(adapter.fetches.load(Ordering::SeqCst), 1);
     }
@@ -1172,7 +1205,7 @@ mod tests {
         ));
 
         let run = run_media(adapter, RunControl::new()).await;
-        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
 
         let (report, messages) = exported(&run);
         assert!(report.complete);

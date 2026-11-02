@@ -2,7 +2,7 @@
 //!
 //! The connection is keyed with `PRAGMA key` before any other statement.
 
-use lethe_adapter::{ContentType, ItemRef, MediaRef, Outcome, PlatformRecord};
+use lethe_adapter::{ContentType, DeleteReach, ItemRef, MediaRef, Outcome, PlatformRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 
 mod state;
@@ -30,7 +30,9 @@ pub struct ItemSnapshot {
     pub media: Vec<MediaRef>,
     pub platform_record: Option<PlatformRecord>,
     pub backup_gap: Option<String>,
-    /// `protected` when matched by the allow-list/pin predicate, else `pending`.
+    pub delete_reach: DeleteReach,
+    /// `protected` when matched by the allow-list/pin predicate, `undeletable` when the
+    /// platform will not delete it, else `pending`.
     pub state: ItemState,
 }
 
@@ -45,6 +47,7 @@ pub struct PendingItem {
     pub media: Vec<MediaRef>,
     pub platform_record: Option<PlatformRecord>,
     pub backup_gap: Option<String>,
+    pub delete_reach: DeleteReach,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +74,16 @@ pub struct PreviewCounts {
     pub deleted: u64,
     pub skipped: u64,
     pub failed: u64,
+    pub undeletable: u64,
+}
+
+/// Rows waiting to run that go only if the person agrees, and how many need both
+/// agreements, so a screen can tell what stays under any choice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PendingConsents {
+    pub backup_gaps: u64,
+    pub only_for_self: u64,
+    pub both: u64,
 }
 
 /// One preview row as a UI lists it: what will go, or what was protected.
@@ -81,6 +94,7 @@ pub struct ItemRow {
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
     pub protected: bool,
+    pub only_for_self: bool,
 }
 
 /// Which preview rows to page through. Rows that already ran are never listed.
@@ -110,6 +124,8 @@ pub struct RunWithoutReceipt {
     pub account: String,
     pub started_secs: i64,
     pub deleted: u64,
+    /// How many of `deleted` other people can still see.
+    pub deleted_only_for_self: u64,
 }
 
 pub struct Store {
@@ -178,8 +194,8 @@ impl Store {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO items
                  (run_id, platform_id, content_type, created_at, token, text, media_json,
-                  platform_record, backup_gap, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  platform_record, backup_gap, delete_reach, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for it in items {
                 let media_json = serde_json::to_string(&it.media)?;
@@ -193,6 +209,7 @@ impl Store {
                     media_json,
                     it.platform_record.as_ref().map(PlatformRecord::as_json),
                     it.backup_gap,
+                    state::reach_as_str(it.delete_reach),
                     it.state.as_str(),
                 ])?;
             }
@@ -218,6 +235,7 @@ impl Store {
                 "deleted" => c.deleted = n,
                 "skipped" => c.skipped = n,
                 "failed" => c.failed = n,
+                "undeletable" => c.undeletable = n,
                 _ => {}
             }
         }
@@ -239,13 +257,20 @@ impl Store {
         })?)
     }
 
-    /// Rows waiting to run whose content the backup cannot hold in full.
-    pub fn pending_backup_gaps(&self, run_id: &str) -> Result<u64> {
+    pub fn pending_consents(&self, run_id: &str) -> Result<PendingConsents> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT COUNT(*) FROM items
-             WHERE run_id = ?1 AND state = 'pending' AND backup_gap IS NOT NULL",
+            "SELECT COALESCE(SUM(backup_gap IS NOT NULL), 0),
+                    COALESCE(SUM(delete_reach = 'only_for_self'), 0),
+                    COALESCE(SUM(backup_gap IS NOT NULL AND delete_reach = 'only_for_self'), 0)
+             FROM items WHERE run_id = ?1 AND state = 'pending'",
         )?;
-        Ok(stmt.query_row(params![run_id], |r| r.get::<_, i64>(0))? as u64)
+        Ok(stmt.query_row(params![run_id], |r| {
+            Ok(PendingConsents {
+                backup_gaps: r.get::<_, i64>(0)? as u64,
+                only_for_self: r.get::<_, i64>(1)? as u64,
+                both: r.get::<_, i64>(2)? as u64,
+            })
+        })?)
     }
 
     /// Keeps the rows the backup cannot hold in full, for a person who did not agree
@@ -259,10 +284,21 @@ impl Store {
         Ok(())
     }
 
+    /// Keeps the rows only this account would stop seeing, for a person who did not
+    /// agree to leave them with everyone else.
+    pub fn protect_only_for_self(&self, run_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE items SET state = ?1
+             WHERE run_id = ?2 AND state = 'pending' AND delete_reach = 'only_for_self'",
+            params![ItemState::Protected.as_str(), run_id],
+        )?;
+        Ok(())
+    }
+
     /// Preview rows, newest first. Covers `pending` and `protected` only.
     pub fn preview_items(&self, run_id: &str, query: &ItemQuery) -> Result<Vec<ItemRow>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT platform_id, content_type, created_at, text, state FROM items
+            "SELECT platform_id, content_type, created_at, text, state, delete_reach FROM items
              WHERE run_id = ?1
                AND state IN ('pending', 'protected')
                AND (?2 = 0 OR state = 'protected')
@@ -285,6 +321,8 @@ impl Store {
                     created_at_secs: r.get(2)?,
                     text: r.get(3)?,
                     protected: r.get::<_, String>(4)? == ItemState::Protected.as_str(),
+                    only_for_self: state::reach_from_stored(&r.get::<_, String>(5)?)
+                        == DeleteReach::OnlyForSelf,
                 })
             },
         )?;
@@ -341,7 +379,7 @@ impl Store {
     pub fn claim_pending_items(&self, run_id: &str, n: usize) -> Result<Vec<PendingItem>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT platform_id, token, content_type, created_at, text, media_json,
-                    platform_record, backup_gap FROM items
+                    platform_record, backup_gap, delete_reach FROM items
              WHERE run_id = ?1 AND state = 'pending' LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![run_id, n as i64], |r| {
@@ -376,6 +414,7 @@ impl Store {
                 media,
                 platform_record,
                 backup_gap: r.get(7)?,
+                delete_reach: state::reach_from_stored(&r.get::<_, String>(8)?),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -452,7 +491,9 @@ impl Store {
     pub fn runs_without_receipt(&self) -> Result<Vec<RunWithoutReceipt>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT r.run_id, r.platform, r.account, r.started,
-                    (SELECT COUNT(*) FROM items i WHERE i.run_id = r.run_id AND i.state = 'deleted')
+                    (SELECT COUNT(*) FROM items i WHERE i.run_id = r.run_id AND i.state = 'deleted'),
+                    (SELECT COUNT(*) FROM items i WHERE i.run_id = r.run_id AND i.state = 'deleted'
+                        AND i.delete_reach = 'only_for_self')
              FROM runs r
              WHERE r.state NOT IN ('enumerating', 'preview')
                AND NOT EXISTS (SELECT 1 FROM receipts c WHERE c.run_id = r.run_id)
@@ -465,6 +506,7 @@ impl Store {
                 account: row.get(2)?,
                 started_secs: row.get(3)?,
                 deleted: row.get::<_, i64>(4)? as u64,
+                deleted_only_for_self: row.get::<_, i64>(5)? as u64,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -543,6 +585,12 @@ fn migrate_content_columns(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "items", "file_failure")? {
         conn.execute("ALTER TABLE items ADD COLUMN file_failure TEXT", [])?;
     }
+    if !column_exists(conn, "items", "delete_reach")? {
+        conn.execute(
+            "ALTER TABLE items ADD COLUMN delete_reach TEXT NOT NULL DEFAULT 'everyone'",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -578,6 +626,7 @@ mod tests {
             }],
             platform_record: None,
             backup_gap: None,
+            delete_reach: DeleteReach::Everyone,
             state,
         }
     }
@@ -761,6 +810,7 @@ mod tests {
                     account: "a".into(),
                     started_secs: 4,
                     deleted: 1,
+                    deleted_only_for_self: 0,
                 },
                 RunWithoutReceipt {
                     run_id: "older".into(),
@@ -768,6 +818,7 @@ mod tests {
                     account: "a".into(),
                     started_secs: 3,
                     deleted: 0,
+                    deleted_only_for_self: 0,
                 },
             ]
         );
@@ -911,13 +962,13 @@ mod tests {
         chosen.backup_gap = Some("no file".into());
         s.snapshot_items("r", &[gap, chosen, snap("whole", ItemState::Pending)])
             .unwrap();
-        assert_eq!(s.pending_backup_gaps("r").unwrap(), 1);
+        assert_eq!(s.pending_consents("r").unwrap().backup_gaps, 1);
 
         s.protect_backup_gaps("r").unwrap();
 
         let counts = s.preview_counts("r").unwrap();
         assert_eq!((counts.pending, counts.protected), (1, 2));
-        assert_eq!(s.pending_backup_gaps("r").unwrap(), 0);
+        assert_eq!(s.pending_consents("r").unwrap().backup_gaps, 0);
     }
 
     #[test]
