@@ -9,7 +9,8 @@ use super::tests::{
     downloaded, match_all_filter, media_item, run_media, run_media_allowing_only_for_self,
     MediaAdapter,
 };
-use super::{snapshot, RunOutcome, RunRequest};
+use super::{execute, snapshot, RunOutcome, RunRequest};
+use crate::scheduler::Scheduler;
 use crate::RunControl;
 
 fn item(id: &str, reach: DeleteReach) -> Item {
@@ -34,7 +35,10 @@ async fn without_consent_only_what_goes_for_everyone_is_deleted() {
 
     let run = run_media(adapter.clone(), RunControl::new()).await;
 
-    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, ..Default::default() });
+    assert_eq!(
+        run.outcome.as_ref().unwrap(),
+        &RunOutcome { deleted: 1, kept_only_for_self: 1, undeletable: 1, ..Default::default() }
+    );
     assert_eq!(adapter.journal(), ["delete for-everyone"]);
     let counts = run.store.preview_counts("media").unwrap();
     assert_eq!((counts.protected, counts.undeletable), (1, 1));
@@ -48,7 +52,7 @@ async fn with_consent_it_also_goes_for_this_account_and_is_counted_apart() {
 
     assert_eq!(
         run.outcome.as_ref().unwrap(),
-        &RunOutcome { deleted: 2, deleted_only_for_self: 1, ..Default::default() }
+        &RunOutcome { deleted: 2, deleted_only_for_self: 1, undeletable: 1, ..Default::default() }
     );
     assert_eq!(adapter.journal(), ["delete for-everyone", "delete only-mine"]);
 }
@@ -62,11 +66,9 @@ async fn a_run_without_a_receipt_still_tells_what_others_can_see() {
     assert_eq!((runs[0].deleted, runs[0].deleted_only_for_self), (2, 1));
 }
 
-/// A run stopped at the preview, where the person can still change what goes.
-async fn previewed(items: Vec<Item>) -> Store {
-    let store = Store::open_in_memory("test-key").unwrap();
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-    let req = RunRequest {
+/// The request behind `previewed`: no consent given.
+fn preview_request() -> RunRequest {
+    RunRequest {
         run_id: "preview".into(),
         platform: "fake".into(),
         account_id: "fake:a".into(),
@@ -77,7 +79,14 @@ async fn previewed(items: Vec<Item>) -> Store {
         allow_incomplete_backup: false,
         allow_lost_files: false,
         allow_only_for_self: false,
-    };
+    }
+}
+
+/// A run stopped at the preview, where the person can still change what goes.
+async fn previewed(items: Vec<Item>) -> Store {
+    let store = Store::open_in_memory("test-key").unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let req = preview_request();
     store
         .create_run(&NewRun {
             run_id: req.run_id.clone(),
@@ -132,4 +141,23 @@ async fn a_retry_still_knows_the_item_goes_only_for_this_account() {
 
     let claimed = run.store.claim_pending_items("retry", 10).unwrap();
     assert_eq!(claimed[0].delete_reach, DeleteReach::OnlyForSelf);
+}
+
+#[tokio::test]
+async fn a_run_resumed_after_a_stop_still_counts_what_it_kept() {
+    let mut store = previewed(mixed_chat()).await;
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (adapter, req) = (no_files(mixed_chat()), preview_request());
+    let stopped = RunControl::new();
+    stopped.stop();
+    let first = execute(adapter.clone(), &mut store, &mut Scheduler::new(), &req, stopped, &tx, None).await;
+    assert!(first.is_err(), "stopped right after the protections");
+
+    let resumed =
+        execute(adapter, &mut store, &mut Scheduler::new(), &req, RunControl::new(), &tx, None).await.unwrap();
+
+    assert_eq!(
+        resumed,
+        RunOutcome { deleted: 1, kept_only_for_self: 1, undeletable: 1, ..Default::default() }
+    );
 }

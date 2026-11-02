@@ -53,7 +53,7 @@ pub struct BackupTarget {
 }
 
 /// Final tally of a Phase-2 run. The caller (which owns the clock + identity)
-/// turns this into a `RunSummary` and signs the receipt.
+/// dates it with `summary` and signs the receipt.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RunOutcome {
     pub deleted: u64,
@@ -61,6 +61,35 @@ pub struct RunOutcome {
     pub deleted_only_for_self: u64,
     pub skipped: u64,
     pub failed: u64,
+    /// Items that only this account would have stopped seeing and that stayed: for
+    /// want of consent, or protected by the person.
+    pub kept_only_for_self: u64,
+    /// Items in the set the platform does not let this account delete.
+    pub undeletable: u64,
+}
+
+impl RunOutcome {
+    /// The receipt's counts for this outcome, for the caller to date and sign.
+    pub fn summary(
+        &self,
+        req: &RunRequest,
+        started_epoch_secs: u64,
+        finished_epoch_secs: u64,
+    ) -> RunSummary {
+        RunSummary {
+            run_id: req.run_id.clone(),
+            platform: req.platform.clone(),
+            account_label: req.account_label.clone(),
+            started_epoch_secs,
+            finished_epoch_secs,
+            deleted: self.deleted,
+            deleted_only_for_self: self.deleted_only_for_self,
+            skipped: self.skipped,
+            failed: self.failed,
+            kept_only_for_self: self.kept_only_for_self,
+            undeletable: self.undeletable,
+        }
+    }
 }
 
 /// Sign the run summary and persist the receipt. Shared by the CLI and the
@@ -182,7 +211,11 @@ pub async fn execute(
     // From here on the preview is final: `set_item_protected` refuses, and every
     // protection committed before this line is seen by the first claim.
     store.set_run_state(&req.run_id, RunState::Executing)?;
-    let total = store.preview_counts(&req.run_id)?.pending;
+    let counts = store.preview_counts(&req.run_id)?;
+    let total = counts.pending;
+    // Read from the store, so a run resumed after a stop still counts them.
+    outcome.kept_only_for_self = counts.protected_only_for_self;
+    outcome.undeletable = counts.undeletable;
     let _ = progress.send(ProgressEvent::Deleting { deleted: 0, skipped: 0, failed: 0, total });
 
     let consents = Consents {
@@ -316,7 +349,7 @@ pub async fn execute(
     }
 
     // Receipt signing is the caller's job (it owns the clock + identity): it
-    // builds a `RunSummary` from this `RunOutcome` and calls `store_receipt`.
+    // dates this `RunOutcome` with `RunOutcome::summary` and calls `store_receipt`.
     let _ = progress.send(ProgressEvent::Done { run_id: req.run_id.clone() });
     Ok(outcome)
 }
@@ -446,7 +479,7 @@ mod tests {
     use lethe_crypto::container::ContainerReader;
     use std::fs::File;
     use std::sync::Mutex;
-    use lethe_crypto::receipt::{verify, ReceiptSigner, RunSummary};
+    use lethe_crypto::receipt::{verify, ReceiptSigner};
     use lethe_store::{ItemQuery, NewRun, Store};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -643,18 +676,7 @@ mod tests {
 
         // Receipt signs the counts and verifies offline.
         let signer = ReceiptSigner::generate();
-        let summary = RunSummary {
-            run_id: req.run_id.clone(),
-            platform: req.platform.clone(),
-            account_label: req.account_label.clone(),
-            started_epoch_secs: 0,
-            finished_epoch_secs: 1,
-            deleted: outcome.deleted,
-            deleted_only_for_self: outcome.deleted_only_for_self,
-            skipped: outcome.skipped,
-            failed: outcome.failed,
-        };
-        let receipt = store_receipt(&store, &signer, &summary).unwrap();
+        let receipt = store_receipt(&store, &signer, &outcome.summary(&req, 0, 1)).unwrap();
         assert!(verify(&receipt).is_ok());
     }
 

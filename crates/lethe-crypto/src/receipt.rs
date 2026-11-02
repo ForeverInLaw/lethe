@@ -31,6 +31,13 @@ pub struct RunSummary {
     pub deleted_only_for_self: u64,
     pub skipped: u64,
     pub failed: u64,
+    /// Items that only this account would have stopped seeing, left because the
+    /// person did not agree to that. Left out when none, like the field below.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub kept_only_for_self: u64,
+    /// Items in the set the platform did not let this account delete.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub undeletable: u64,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -131,6 +138,8 @@ mod tests {
             deleted_only_for_self: 0,
             skipped: 2,
             failed: 1,
+            kept_only_for_self: 0,
+            undeletable: 0,
         }
     }
 
