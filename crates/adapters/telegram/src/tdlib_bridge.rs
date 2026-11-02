@@ -62,6 +62,9 @@ pub struct TelegramChatScope {
     pub can_delete_for_all_users: bool,
     pub can_delete_only_for_self: bool,
     pub cleanability: TelegramCleanability,
+    /// Changes whenever the chat gets a new message, so a count taken while it was
+    /// the same still holds. None when TDLib does not know the last message.
+    pub last_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +316,7 @@ fn map_chat_scope(chat: &types::Chat) -> TelegramChatScope {
             chat.can_be_deleted_for_all_users,
             chat.can_be_deleted_only_for_self,
         ),
+        last_message_id: chat.last_message.as_ref().map(|message| message.id),
     }
 }
 
