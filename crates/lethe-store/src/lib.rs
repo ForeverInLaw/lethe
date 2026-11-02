@@ -5,9 +5,11 @@
 use lethe_adapter::{ContentType, DeleteReach, ItemRef, MediaRef, Outcome, PlatformRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 
+mod pending;
 mod retention;
 mod state;
 mod unsaved_files;
+pub use pending::{PendingConsents, PendingMedia};
 pub use state::{FileFailure, ItemState, RunState};
 pub use unsaved_files::{FileRetryRun, UnsavedFiles, UnsavedItem};
 
@@ -60,13 +62,6 @@ pub struct NewRun {
     pub started_secs: i64,
 }
 
-/// Files still to be archived for a run, as far as Phase 1 knows their sizes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct PendingMedia {
-    pub bytes: u64,
-    pub largest_bytes: u64,
-}
-
 /// Per-state counts — the dry-run preview projection.
 #[derive(Debug, Clone, Default)]
 pub struct PreviewCounts {
@@ -76,15 +71,6 @@ pub struct PreviewCounts {
     pub skipped: u64,
     pub failed: u64,
     pub undeletable: u64,
-}
-
-/// Rows waiting to run that go only if the person agrees, and how many need both
-/// agreements, so a screen can tell what stays under any choice.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PendingConsents {
-    pub backup_gaps: u64,
-    pub only_for_self: u64,
-    pub both: u64,
 }
 
 /// One preview row as a UI lists it: what will go, or what was protected.
@@ -243,59 +229,6 @@ impl Store {
             }
         }
         Ok(c)
-    }
-
-    pub fn pending_media(&self, run_id: &str) -> Result<PendingMedia> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT COALESCE(SUM(json_extract(file.value, '$.size')), 0),
-                    COALESCE(MAX(json_extract(file.value, '$.size')), 0)
-             FROM items, json_each(items.media_json) AS file
-             WHERE items.run_id = ?1 AND items.state = 'pending'",
-        )?;
-        Ok(stmt.query_row(params![run_id], |r| {
-            Ok(PendingMedia {
-                bytes: r.get::<_, i64>(0)? as u64,
-                largest_bytes: r.get::<_, i64>(1)? as u64,
-            })
-        })?)
-    }
-
-    pub fn pending_consents(&self, run_id: &str) -> Result<PendingConsents> {
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT COALESCE(SUM(backup_gap IS NOT NULL), 0),
-                    COALESCE(SUM(delete_reach = 'only_for_self'), 0),
-                    COALESCE(SUM(backup_gap IS NOT NULL AND delete_reach = 'only_for_self'), 0)
-             FROM items WHERE run_id = ?1 AND state = 'pending'",
-        )?;
-        Ok(stmt.query_row(params![run_id], |r| {
-            Ok(PendingConsents {
-                backup_gaps: r.get::<_, i64>(0)? as u64,
-                only_for_self: r.get::<_, i64>(1)? as u64,
-                both: r.get::<_, i64>(2)? as u64,
-            })
-        })?)
-    }
-
-    /// Keeps the rows the backup cannot hold in full, for a person who did not agree
-    /// to losing part of them.
-    pub fn protect_backup_gaps(&self, run_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE items SET state = ?1
-             WHERE run_id = ?2 AND state = 'pending' AND backup_gap IS NOT NULL",
-            params![ItemState::Protected.as_str(), run_id],
-        )?;
-        Ok(())
-    }
-
-    /// Keeps the rows only this account would stop seeing, for a person who did not
-    /// agree to leave them with everyone else.
-    pub fn protect_only_for_self(&self, run_id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE items SET state = ?1
-             WHERE run_id = ?2 AND state = 'pending' AND delete_reach = 'only_for_self'",
-            params![ItemState::Protected.as_str(), run_id],
-        )?;
-        Ok(())
     }
 
     /// Preview rows, newest first. Covers `pending` and `protected` only.
@@ -620,7 +553,7 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 mod tests {
     use super::*;
 
-    fn snap(id: &str, state: ItemState) -> ItemSnapshot {
+    pub(crate) fn snap(id: &str, state: ItemState) -> ItemSnapshot {
         ItemSnapshot {
             item_ref: ItemRef {
                 platform_id: id.into(),
@@ -652,7 +585,7 @@ mod tests {
         }
     }
 
-    fn run_with(items: &[ItemSnapshot]) -> Store {
+    pub(crate) fn run_with(items: &[ItemSnapshot]) -> Store {
         let s = Store::open_in_memory("k").unwrap();
         s.create_run(&run("r")).unwrap();
         s.snapshot_items("r", items).unwrap();
@@ -1032,38 +965,5 @@ mod tests {
 
         assert_eq!(claimed[0].platform_record, None);
         assert_eq!(claimed[0].backup_gap, None);
-    }
-
-    #[test]
-    fn pending_media_sizes_only_files_that_will_be_archived() {
-        let sized = |id: &str, state: ItemState, sizes: &[Option<u64>]| ItemSnapshot {
-            media: sizes
-                .iter()
-                .map(|size| MediaRef {
-                    url: format!("file-{id}"),
-                    mime: None,
-                    file_name: None,
-                    size: *size,
-                })
-                .collect(),
-            ..snap(id, state)
-        };
-        let s = run_with(&[
-            sized("a", ItemState::Pending, &[Some(100), Some(700)]),
-            sized("b", ItemState::Pending, &[None]),
-            sized("c", ItemState::Protected, &[Some(9_000)]),
-            sized("d", ItemState::Pending, &[]),
-        ]);
-
-        let media = s.pending_media("r").unwrap();
-
-        assert_eq!(media.bytes, 800);
-        assert_eq!(media.largest_bytes, 700);
-    }
-
-    #[test]
-    fn pending_media_is_empty_for_a_run_without_files() {
-        let s = run_with(&[]);
-        assert_eq!(s.pending_media("r").unwrap(), PendingMedia::default());
     }
 }
