@@ -34,7 +34,10 @@ async fn without_consent_only_what_goes_for_everyone_is_deleted() {
 
     let run = run_media(adapter.clone(), RunControl::new()).await;
 
-    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, ..Default::default() });
+    assert_eq!(
+        run.outcome.as_ref().unwrap(),
+        &RunOutcome { deleted: 1, kept_only_for_self: 1, undeletable: 1, ..Default::default() }
+    );
     assert_eq!(adapter.journal(), ["delete for-everyone"]);
     let counts = run.store.preview_counts("media").unwrap();
     assert_eq!((counts.protected, counts.undeletable), (1, 1));
@@ -48,7 +51,7 @@ async fn with_consent_it_also_goes_for_this_account_and_is_counted_apart() {
 
     assert_eq!(
         run.outcome.as_ref().unwrap(),
-        &RunOutcome { deleted: 2, deleted_only_for_self: 1, ..Default::default() }
+        &RunOutcome { deleted: 2, deleted_only_for_self: 1, undeletable: 1, ..Default::default() }
     );
     assert_eq!(adapter.journal(), ["delete for-everyone", "delete only-mine"]);
 }

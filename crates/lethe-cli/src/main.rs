@@ -111,17 +111,7 @@ async fn main() -> anyhow::Result<()> {
     // Receipt = per-install Ed25519 over a counts-only summary. The CLI owns the
     // clock + identity; a real build loads the signer from the OS keychain.
     let signer = lethe_crypto::receipt::ReceiptSigner::generate();
-    let summary = lethe_crypto::receipt::RunSummary {
-        run_id: req.run_id.clone(),
-        platform: req.platform.clone(),
-        account_label: req.account_label.clone(),
-        started_epoch_secs: 0,
-        finished_epoch_secs: now_secs(),
-        deleted: outcome.deleted,
-        deleted_only_for_self: outcome.deleted_only_for_self,
-        skipped: outcome.skipped,
-        failed: outcome.failed,
-    };
+    let summary = outcome.summary(&req, 0, now_secs());
     let receipt = pipeline::store_receipt(&store, &signer, &summary)?;
     println!("receipt public key: {}", receipt.public_key_hex);
 
