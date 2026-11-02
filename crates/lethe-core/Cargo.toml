@@ -27,3 +27,6 @@ regex.workspace = true
 unicode-normalization = "0.1"
 sanitize-filename = "0.6"
 mime2ext = "0.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

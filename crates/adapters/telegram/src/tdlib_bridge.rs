@@ -205,12 +205,12 @@ pub async fn download_message_file(
     let enums::Message::Message(message) =
         functions::get_message(chat_id, message_id, client_id.raw())
             .await
-            .map_err(map_tdlib_error)?;
+            .map_err(map_message_read_error)?;
     let file = message_files(&message.content)
         .into_iter()
         .map(|attachment| attachment.file)
         .find(|file| file.remote.unique_id == unique_id)
-        .ok_or_else(|| AdapterError::Platform("the message no longer has this file".into()))?;
+        .ok_or_else(|| AdapterError::FileRefused("the message no longer has this file".into()))?;
 
     let fetched = functions::download_file(file.id, DOWNLOAD_PRIORITY, 0, 0, true, client_id.raw())
         .await
@@ -219,7 +219,7 @@ pub async fn download_message_file(
             let bytes_on_disk =
                 std::fs::metadata(&downloaded.local.path).map_or(0, |meta| meta.len());
             if !download_is_complete(&downloaded, bytes_on_disk) {
-                return Err(AdapterError::Platform(
+                return Err(AdapterError::Transport(
                     "the file could not be downloaded".into(),
                 ));
             }
@@ -232,7 +232,7 @@ pub async fn download_message_file(
     // Core only releases what it receives, so a partial download is removed here.
     if fetched.is_err() {
         if let Err(error) = delete_downloaded_file(client_id, file.id).await {
-            return Err(AdapterError::Platform(format!(
+            return Err(AdapterError::Transport(format!(
                 "the file could not be downloaded, and its partial copy stayed on disk: {error}"
             )));
         }
@@ -476,11 +476,23 @@ fn map_tdlib_error(error: types::Error) -> AdapterError {
     }
 }
 
-/// A 404 here means the file is gone, not the message, so it must not read as
-/// "already deleted".
-fn map_download_error(error: types::Error) -> AdapterError {
+/// A server fault says nothing about the message, so it is worth another try.
+fn map_message_read_error(error: types::Error) -> AdapterError {
+    let code = error.code;
     match map_tdlib_error(error) {
-        AdapterError::NotFound => AdapterError::Platform("the file is no longer available".into()),
+        AdapterError::Platform(message) if code >= 500 => AdapterError::Transport(message),
+        other => other,
+    }
+}
+
+/// A 404 here means the file is gone, not the message, so it must not read as
+/// "already deleted". Only a client error is Telegram refusing the file.
+fn map_download_error(error: types::Error) -> AdapterError {
+    let code = error.code;
+    match map_tdlib_error(error) {
+        AdapterError::NotFound => AdapterError::FileRefused("the file is no longer available".into()),
+        AdapterError::Platform(message) if (400..500).contains(&code) => AdapterError::FileRefused(message),
+        AdapterError::Platform(message) => AdapterError::Transport(message),
         other => other,
     }
 }
@@ -494,6 +506,24 @@ fn parse_flood_wait(message: &str) -> Option<u64> {
 #[cfg(all(test, any(feature = "tdlib-local", feature = "tdlib-download")))]
 mod tests {
     use super::*;
+
+    fn tdlib_error(code: i32, message: &str) -> types::Error {
+        types::Error { code, message: message.into() }
+    }
+
+    #[test]
+    fn only_a_client_error_counts_as_telegram_refusing_a_file() {
+        for code in [400, 404] {
+            let error = map_download_error(tdlib_error(code, "no such file"));
+            assert!(matches!(error, AdapterError::FileRefused(_)), "{code}: {error}");
+        }
+        assert!(matches!(map_download_error(tdlib_error(500, "internal")), AdapterError::Transport(_)));
+        assert!(matches!(map_download_error(tdlib_error(401, "unauthorized")), AdapterError::Auth(_)));
+        assert!(matches!(
+            map_download_error(tdlib_error(420, "FLOOD_WAIT_5")),
+            AdapterError::RateLimited { .. }
+        ));
+    }
 
     #[test]
     fn classifies_supergroup_channel_flag() {
@@ -828,7 +858,7 @@ mod tests {
             message: "Not Found".into(),
         });
 
-        assert!(matches!(error, AdapterError::Platform(_)));
+        assert!(matches!(error, AdapterError::FileRefused(_)));
     }
 
     #[test]

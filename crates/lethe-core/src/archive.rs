@@ -81,12 +81,28 @@ impl ArchiveWriter {
         Ok(Self { container })
     }
 
-    /// Appends one item and its files. `files` lines up with `item.media`.
-    pub(crate) fn write_item(&mut self, item: &PendingItem, files: &[FetchedMedia]) -> Result<()> {
+    /// Appends one item and its files. `files` lines up with `item.media`; `None` is
+    /// a file that could not be saved, and `lost_reasons` says why.
+    pub(crate) fn write_item(
+        &mut self,
+        item: &PendingItem,
+        files: &[Option<FetchedMedia>],
+        lost_reasons: &[String],
+    ) -> Result<()> {
         let sizes = files
             .iter()
-            .map(|file| Ok(std::fs::metadata(&file.path).map_err(io_error)?.len()))
+            .map(|file| match file {
+                Some(file) => Ok(std::fs::metadata(&file.path).map_err(io_error)?.len()),
+                None => Ok(0),
+            })
             .collect::<Result<Vec<u64>>>()?;
+        let backup_gap = item
+            .backup_gap
+            .iter()
+            .cloned()
+            .chain(lost_reasons.iter().map(|reason| format!("a file could not be saved: {reason}")))
+            .collect::<Vec<_>>()
+            .join("; ");
         let record = ItemRecord {
             platform_id: &item.item_ref.platform_id,
             token: item.item_ref.token.as_deref(),
@@ -104,11 +120,13 @@ impl ArchiveWriter {
                 })
                 .collect(),
             platform_record: item.platform_record.as_ref(),
-            backup_gap: item.backup_gap.as_deref(),
+            backup_gap: Some(backup_gap.as_str()).filter(|gap| !gap.is_empty()),
         };
         self.container.write_chunk(&to_json(&record)?)?;
         for (file, size) in files.iter().zip(sizes) {
-            self.write_file(file, size)?;
+            if let Some(file) = file {
+                self.write_file(file, size)?;
+            }
         }
         Ok(())
     }
