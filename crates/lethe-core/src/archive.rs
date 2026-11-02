@@ -8,8 +8,10 @@
 //! A record states how many chunks and bytes follow for each file, so a reader
 //! can walk the archive and tell records from file contents.
 
+mod export;
+
 use std::fs::File;
-use std::io::Read;
+use std::io::{self, Read, Write};
 
 use lethe_adapter::{FetchedMedia, MediaRef, PlatformRecord};
 use lethe_crypto::container::{ContainerReader, ContainerWriter};
@@ -19,6 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::pipeline::{BackupTarget, RunRequest};
 use crate::{EngineError, Result};
+
+pub use export::{ArchiveExport, ExportReport};
 
 const MEDIA_CHUNK_BYTES: usize = 1024 * 1024;
 
@@ -141,45 +145,98 @@ pub struct ArchiveAudit {
     pub media_files: u64,
 }
 
+/// An item record as a reader sees it. Every field is optional, because archives
+/// written by older versions lack some of them.
 #[derive(Deserialize)]
-struct AuditRecord {
+struct ReadRecord {
     #[serde(default)]
-    media: Vec<AuditMedia>,
+    platform_id: String,
+    content_type: Option<String>,
+    created_at_secs: Option<i64>,
+    text: Option<String>,
+    backup_gap: Option<String>,
+    #[serde(default)]
+    media: Vec<ReadMedia>,
 }
 
-/// Archives from before file contents were stored carry neither field.
+/// Archives from before file contents were stored carry no `archived_bytes` or
+/// `chunks`, so such a file has nothing to read.
 #[derive(Deserialize)]
-struct AuditMedia {
+struct ReadMedia {
+    mime: Option<String>,
+    file_name: Option<String>,
     #[serde(default)]
     archived_bytes: u64,
     #[serde(default)]
     chunks: u64,
 }
 
+/// Why a file could not be copied out of the archive. Only the first case means
+/// the archive itself is broken.
+enum CopyFailure {
+    Archive(EngineError),
+    Output(io::Error),
+}
+
+impl From<CopyFailure> for EngineError {
+    fn from(failure: CopyFailure) -> Self {
+        match failure {
+            CopyFailure::Archive(error) => error,
+            CopyFailure::Output(error) => io_error(error),
+        }
+    }
+}
+
+/// Walks an archive record by record, for the readers of its layout.
+struct ArchiveWalk<R: Read> {
+    reader: ContainerReader<R>,
+}
+
+impl<R: Read> ArchiveWalk<R> {
+    /// Opens the archive and reads its manifest. A wrong key fails here.
+    fn open(source: R, key: &DataKey) -> Result<(Self, Vec<u8>)> {
+        let mut reader = ContainerReader::open(source, key)?;
+        let manifest = reader.read_chunk()?.ok_or_else(|| corrupt("no manifest"))?;
+        Ok((Self { reader }, manifest))
+    }
+
+    /// The next record, parsed and as stored. `None` at the end of a sealed archive.
+    fn next_record(&mut self) -> Result<Option<(ReadRecord, Vec<u8>)>> {
+        let Some(chunk) = self.reader.read_chunk()? else {
+            return Ok(None);
+        };
+        let record = serde_json::from_slice(&chunk).map_err(|_| corrupt("unreadable item record"))?;
+        Ok(Some((record, chunk)))
+    }
+
+    /// Copies the file that comes next in the archive, one chunk at a time.
+    fn copy_file(&mut self, media: &ReadMedia, out: &mut impl Write) -> std::result::Result<(), CopyFailure> {
+        let mut bytes = 0;
+        for _ in 0..media.chunks {
+            let chunk = self
+                .reader
+                .read_chunk()
+                .map_err(|error| CopyFailure::Archive(error.into()))?
+                .ok_or_else(|| CopyFailure::Archive(corrupt("a file is cut short")))?;
+            out.write_all(&chunk).map_err(CopyFailure::Output)?;
+            bytes += chunk.len() as u64;
+        }
+        if bytes != media.archived_bytes {
+            return Err(CopyFailure::Archive(corrupt("a file does not match its record")));
+        }
+        Ok(())
+    }
+}
+
 /// Decrypts the whole archive and checks that every file its records announce is
 /// there in full. Fails on a wrong key, tampering, truncation or a broken layout.
 pub fn audit_archive<R: Read>(source: R, key: &DataKey) -> Result<ArchiveAudit> {
-    let mut reader = ContainerReader::open(source, key)?;
-    if reader.read_chunk()?.is_none() {
-        return Err(corrupt("no manifest"));
-    }
-
+    let (mut walk, _manifest) = ArchiveWalk::open(source, key)?;
     let mut audit = ArchiveAudit::default();
-    while let Some(chunk) = reader.read_chunk()? {
-        let record: AuditRecord =
-            serde_json::from_slice(&chunk).map_err(|_| corrupt("unreadable item record"))?;
+    while let Some((record, _)) = walk.next_record()? {
         audit.items += 1;
-        for media in record.media {
-            let mut bytes = 0;
-            for _ in 0..media.chunks {
-                let chunk = reader
-                    .read_chunk()?
-                    .ok_or_else(|| corrupt("a file is cut short"))?;
-                bytes += chunk.len() as u64;
-            }
-            if bytes != media.archived_bytes {
-                return Err(corrupt("a file does not match its record"));
-            }
+        for media in &record.media {
+            walk.copy_file(media, &mut io::sink())?;
             audit.media_files += u64::from(media.chunks > 0);
         }
     }
@@ -204,9 +261,9 @@ fn content_type_str(ct: lethe_adapter::ContentType) -> &'static str {
 mod tests {
     use super::*;
 
-    const KEY: DataKey = [7u8; 32];
+    pub(super) const KEY: DataKey = [7u8; 32];
 
-    fn archive(chunks: &[&[u8]]) -> Vec<u8> {
+    pub(super) fn archive(chunks: &[&[u8]]) -> Vec<u8> {
         let mut buf = Vec::new();
         let mut writer = ContainerWriter::create(&mut buf, &KEY).unwrap();
         for chunk in chunks {

@@ -99,6 +99,17 @@ pub struct StoredReceipt {
     pub signature_hex: String,
 }
 
+/// A run that started deleting and never got a receipt: stopped, failed or cut
+/// short by a crash. Its backup is the only copy of what it deleted so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunWithoutReceipt {
+    pub run_id: String,
+    pub platform: String,
+    pub account: String,
+    pub started_secs: i64,
+    pub deleted: u64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -135,6 +146,16 @@ impl Store {
                 RunState::Enumerating.as_str(),
                 run.started_secs,
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Dates the run by the moment it begins deleting. It was created at the preview,
+    /// which can be long before.
+    pub fn set_run_started(&self, run_id: &str, started_secs: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET started = ?1 WHERE run_id = ?2",
+            params![started_secs, run_id],
         )?;
         Ok(())
     }
@@ -422,6 +443,29 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Runs past the preview that have no receipt, most recently started first.
+    pub fn runs_without_receipt(&self) -> Result<Vec<RunWithoutReceipt>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT r.run_id, r.platform, r.account, r.started,
+                    (SELECT COUNT(*) FROM items i WHERE i.run_id = r.run_id AND i.state = 'deleted')
+             FROM runs r
+             WHERE r.state NOT IN ('enumerating', 'preview')
+               AND NOT EXISTS (SELECT 1 FROM receipts c WHERE c.run_id = r.run_id)
+             ORDER BY r.started DESC, r.rowid DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(RunWithoutReceipt {
+                run_id: row.get(0)?,
+                platform: row.get(1)?,
+                account: row.get(2)?,
+                started_secs: row.get(3)?,
+                deleted: row.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn log(&self, run_id: &str, at_secs: i64, level: &str, message: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO activity_log (run_id, at, level, message) VALUES (?1, ?2, ?3, ?4)",
@@ -679,6 +723,57 @@ mod tests {
         assert!(!s.set_item_protected("r", "2", false).unwrap());
         let counts = s.preview_counts("r").unwrap();
         assert_eq!((counts.pending, counts.protected), (1, 1));
+    }
+
+    #[test]
+    fn runs_past_the_preview_without_a_receipt_are_listed_with_what_they_deleted() {
+        let mut s = Store::open_in_memory("k").unwrap();
+        for (id, started, state) in [
+            ("previewed", 1, RunState::Preview),
+            ("receipted", 2, RunState::Executing),
+            ("older", 3, RunState::Executing),
+            ("stopped", 4, RunState::Executing),
+        ] {
+            s.create_run(&NewRun { started_secs: started, ..run(id) }).unwrap();
+            s.set_run_state(id, state).unwrap();
+        }
+        s.snapshot_items("stopped", &[snap("gone", ItemState::Pending), snap("left", ItemState::Pending)])
+            .unwrap();
+        s.record_outcomes("stopped", &[("gone".to_owned(), Outcome::Deleted)]).unwrap();
+        s.save_receipt("receipted", "{}", "pub", "sig").unwrap();
+
+        let runs = s.runs_without_receipt().unwrap();
+
+        assert_eq!(
+            runs,
+            [
+                RunWithoutReceipt {
+                    run_id: "stopped".into(),
+                    platform: "bluesky".into(),
+                    account: "a".into(),
+                    started_secs: 4,
+                    deleted: 1,
+                },
+                RunWithoutReceipt {
+                    run_id: "older".into(),
+                    platform: "bluesky".into(),
+                    account: "a".into(),
+                    started_secs: 3,
+                    deleted: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_is_dated_by_when_it_began_deleting_not_by_its_preview() {
+        let s = Store::open_in_memory("k").unwrap();
+        s.create_run(&NewRun { started_secs: 1, ..run("r") }).unwrap();
+        s.set_run_state("r", RunState::Executing).unwrap();
+
+        s.set_run_started("r", 9).unwrap();
+
+        assert_eq!(s.runs_without_receipt().unwrap()[0].started_secs, 9);
     }
 
     #[test]

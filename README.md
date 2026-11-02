@@ -55,6 +55,10 @@ the platform returned, so alt text, links and quotes stay too. A post whose file
 be fetched stays where it is, and one with a broken file reference is deleted only if
 the person agrees to that. This has passed a live cleanup of posts with files.
 
+`lethe_core::archive::ArchiveExport` turns a backup back into a plain folder: readable
+text, every record in full, and the files under their original names. A damaged or
+unsealed backup exports up to the point it breaks. The folder is not encrypted.
+
 External contributions are not accepted yet: a CLA comes first.
 
 License: AGPL-3.0-only.
