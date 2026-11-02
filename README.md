@@ -50,7 +50,7 @@ back up without their content.
 
 In the desktop app, a Bluesky post goes into the backup with its text and every file
 it owns: images, video, captions and link card thumbnails. A post whose file cannot be
-fetched stays where it is. This has not yet gone through a live cleanup.
+fetched stays where it is. This has passed a live cleanup of posts with files.
 
 External contributions are not accepted yet: a CLA comes first.
 
