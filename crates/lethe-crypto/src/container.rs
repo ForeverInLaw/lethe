@@ -20,6 +20,10 @@ use crate::{CryptoError, DataKey, Result};
 const MAGIC: &[u8; 4] = b"LTHE";
 const VERSION: u8 = 1;
 const HEADER_LEN: usize = 24; // CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_HEADERBYTES
+const AUTH_BYTES: usize = 17; // CRYPTO_SECRETSTREAM_XCHACHA20POLY1305_ABYTES
+/// The most one chunk can hold, far above any file chunk or item record. The writer
+/// enforces it, so the reader can treat a larger frame length as damage.
+const MAX_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
 /// Argon2id KDF: passphrase + salt -> 32-byte data-key (portable wrap path).
 pub fn derive_data_key(passphrase: &str, salt: &[u8]) -> Result<DataKey> {
@@ -59,6 +63,9 @@ impl<W: Write> ContainerWriter<W> {
     }
 
     pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
+        if bytes.len() > MAX_CHUNK_BYTES {
+            return Err(CryptoError::Seal("chunk is too large".into()));
+        }
         // dryoc's `Bytes` bound is `Sized`, so the frame source must be owned.
         let msg = bytes.to_vec();
         let ct = self
@@ -116,6 +123,11 @@ impl<R: Read> ContainerReader<R> {
         // here means the stream was truncated before it was sealed.
         self.source.read_exact(&mut len_bytes).map_err(|_| CryptoError::Open)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
+
+        // A damaged length can claim 4 GiB; no real frame comes near that.
+        if len > MAX_CHUNK_BYTES + AUTH_BYTES {
+            return Err(CryptoError::Open);
+        }
 
         let mut ct = vec![0u8; len];
         self.source.read_exact(&mut ct).map_err(|_| CryptoError::Open)?;
@@ -180,6 +192,30 @@ mod tests {
         // magic+version+header+len prefix); the AEAD tag must reject it.
         let off = MAGIC.len() + 1 + HEADER_LEN + 4;
         buf[off] ^= 0x01;
+        let mut r = ContainerReader::open(buf.as_slice(), &k).unwrap();
+        assert!(matches!(r.read_chunk(), Err(CryptoError::Open)));
+    }
+
+    #[test]
+    fn a_chunk_the_reader_would_refuse_cannot_be_written() {
+        let mut buf = Vec::new();
+        let mut w = ContainerWriter::create(&mut buf, &key()).unwrap();
+        assert!(matches!(
+            w.write_chunk(&vec![0u8; MAX_CHUNK_BYTES + 1]),
+            Err(CryptoError::Seal(_))
+        ));
+    }
+
+    #[test]
+    fn a_damaged_frame_length_is_rejected() {
+        let k = key();
+        let mut buf = Vec::new();
+        let mut w = ContainerWriter::create(&mut buf, &k).unwrap();
+        w.write_chunk(b"first").unwrap();
+        w.finish().unwrap();
+
+        let off = MAGIC.len() + 1 + HEADER_LEN;
+        buf[off..off + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         let mut r = ContainerReader::open(buf.as_slice(), &k).unwrap();
         assert!(matches!(r.read_chunk(), Err(CryptoError::Open)));
     }

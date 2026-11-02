@@ -1067,6 +1067,60 @@ mod tests {
         assert_eq!(run.store.preview_counts("media").unwrap().pending, 2);
     }
 
+    /// Exports the run's archive and returns the folder's report and `messages.txt`.
+    fn exported(run: &MediaRun) -> (crate::archive::ExportReport, String) {
+        let parent = std::env::temp_dir().join(format!("lethe-run-export-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parent).unwrap();
+        let report = crate::archive::ArchiveExport::open(File::open(&run.archive).unwrap(), &ARCHIVE_KEY)
+            .unwrap()
+            .write_to(&parent, "export")
+            .unwrap();
+        let messages = std::fs::read_to_string(report.folder.join("messages.txt")).unwrap();
+        (report, messages)
+    }
+
+    #[tokio::test]
+    async fn what_a_run_deleted_comes_back_out_of_its_backup() {
+        let bytes: Vec<u8> = (0..1024 * 1024 + 300).map(|i| (i % 251) as u8).collect();
+        let source = bytes.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", bytes.len() as u64)])],
+            move |_, _| Ok(downloaded(&source)),
+        ));
+
+        let run = run_media(adapter, RunControl::new()).await;
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+
+        let (report, messages) = exported(&run);
+        assert!(report.complete);
+        assert!(messages.contains("caption m1"));
+        assert_eq!(std::fs::read(report.folder.join("files/photo.jpg")).unwrap(), bytes);
+        std::fs::remove_dir_all(report.folder.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_run_exports_what_it_got_to() {
+        let control = RunControl::new();
+        let stop = control.clone();
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![media_item("m1", &[("photo", 3)]), media_item("m2", &[("video", 3)])],
+            move |_, _| {
+                stop.stop();
+                Ok(downloaded(b"abc"))
+            },
+        ));
+
+        let run = run_media(adapter, control).await;
+        assert!(matches!(run.outcome, Err(EngineError::Aborted)));
+
+        let (report, messages) = exported(&run);
+        assert_eq!(report.items, 1);
+        assert_eq!(report.media_files, 1);
+        assert!(messages.contains("caption m1"));
+        assert!(!messages.contains("caption m2"));
+        std::fs::remove_dir_all(report.folder.parent().unwrap()).unwrap();
+    }
+
     #[tokio::test]
     async fn stopping_during_the_last_download_deletes_nothing() {
         let control = RunControl::new();
