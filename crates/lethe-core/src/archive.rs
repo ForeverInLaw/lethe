@@ -5,8 +5,9 @@
 //! per item: record JSON, then the chunks of each file in `media` order
 //! ```
 //!
-//! A record states how many chunks and bytes follow for each file, so a reader
-//! can walk the archive and tell records from file contents.
+//! A record states how many chunks and bytes follow for each stored file, so a
+//! reader can walk the archive and tell records from file contents. A file that
+//! could not be saved states neither, and nothing of it follows.
 
 mod export;
 
@@ -60,7 +61,7 @@ struct MediaRecord<'a> {
 /// How much of a file follows its record. A file that could not be saved has none,
 /// and neither does any file in an archive from before contents were stored; an
 /// empty file has one with no chunks.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct StoredFile {
     archived_bytes: u64,
     chunks: u64,
@@ -196,11 +197,38 @@ struct ReadRecord {
 }
 
 #[derive(Deserialize)]
+#[serde(try_from = "MediaFields")]
 struct ReadMedia {
     mime: Option<String>,
     file_name: Option<String>,
-    #[serde(flatten)]
     stored: Option<StoredFile>,
+}
+
+/// A media entry as written. A record that states only one of the two sizes is
+/// damaged, not a file that was never stored.
+#[derive(Deserialize)]
+struct MediaFields {
+    mime: Option<String>,
+    file_name: Option<String>,
+    archived_bytes: Option<u64>,
+    chunks: Option<u64>,
+}
+
+impl TryFrom<MediaFields> for ReadMedia {
+    type Error = &'static str;
+
+    fn try_from(fields: MediaFields) -> std::result::Result<Self, Self::Error> {
+        let stored = match (fields.archived_bytes, fields.chunks) {
+            (Some(archived_bytes), Some(chunks)) => Some(StoredFile { archived_bytes, chunks }),
+            (None, None) => None,
+            _ => return Err("a file states only part of its size"),
+        };
+        Ok(Self {
+            mime: fields.mime,
+            file_name: fields.file_name,
+            stored,
+        })
+    }
 }
 
 /// Why a file could not be copied out of the archive. Only the first case means
@@ -336,6 +364,21 @@ mod tests {
                 media_files: 0
             }
         );
+    }
+
+    #[test]
+    fn audit_counts_an_empty_file_and_skips_one_that_was_not_saved() {
+        let buf = archive(&[
+            b"{}",
+            br#"{"media":[{"archived_bytes":0,"chunks":0},{"url":"lost"}]}"#,
+        ]);
+        assert_eq!(audit_archive(buf.as_slice(), &KEY).unwrap().media_files, 1);
+    }
+
+    #[test]
+    fn audit_rejects_a_file_that_states_only_part_of_its_size() {
+        let buf = archive(&[b"{}", br#"{"media":[{"archived_bytes":3}]}"#]);
+        assert!(audit_archive(buf.as_slice(), &KEY).is_err());
     }
 
     #[test]

@@ -137,12 +137,12 @@ impl ExportFolder {
         self.records.write_all(b"\n").map_err(io_error)?;
 
         let mut names = Vec::new();
-        let stored = record
+        let stored_files = record
             .media
             .iter()
             .enumerate()
             .filter_map(|(index, media)| Some((index, media, media.stored.as_ref()?)));
-        for (index, media, stored) in stored {
+        for (index, media, stored) in stored_files {
             let wanted = export_file_name(record, media, index);
             match self.add_file(walk, stored, &wanted)? {
                 SavedFile::Whole(name) => {
