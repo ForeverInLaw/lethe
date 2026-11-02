@@ -6,7 +6,9 @@ use lethe_adapter::{ContentType, ItemRef, MediaRef, Outcome, PlatformRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 
 mod state;
-pub use state::{ItemState, RunState};
+mod unsaved_files;
+pub use state::{FileFailure, ItemState, RunState};
+pub use unsaved_files::{FileRetryRun, UnsavedFiles, UnsavedItem};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -399,6 +401,9 @@ impl Store {
                     Outcome::RateLimited { .. } => ("pending", Some("rate limited")),
                 };
                 stmt.execute(params![state, err, run_id, platform_id])?;
+                if state != ItemState::Pending.as_str() {
+                    unsaved_files::forget_earlier_records(&tx, run_id, platform_id)?;
+                }
             }
         }
         tx.commit()?;
@@ -534,6 +539,9 @@ fn migrate_content_columns(conn: &Connection) -> Result<()> {
     }
     if !column_exists(conn, "items", "backup_gap")? {
         conn.execute("ALTER TABLE items ADD COLUMN backup_gap TEXT", [])?;
+    }
+    if !column_exists(conn, "items", "file_failure")? {
+        conn.execute("ALTER TABLE items ADD COLUMN file_failure TEXT", [])?;
     }
     Ok(())
 }

@@ -22,6 +22,33 @@ impl ItemState {
     }
 }
 
+/// Why an item's file did not reach the backup, which decides what may happen next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFailure {
+    /// The platform refused the file, so trying again is unlikely to help. The item
+    /// may go without it, with the person's consent.
+    Unavailable,
+    /// The network or the session stood in the way. The file may still be there, so
+    /// the item only goes once the file is saved or turns out to be unavailable.
+    Unreachable,
+}
+
+impl FileFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FileFailure::Unavailable => "unavailable",
+            FileFailure::Unreachable => "unreachable",
+        }
+    }
+
+    pub(crate) fn from_stored(stored: &str) -> Self {
+        match stored {
+            "unavailable" => FileFailure::Unavailable,
+            _ => FileFailure::Unreachable,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {
     Enumerating,

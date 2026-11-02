@@ -305,7 +305,7 @@ fn is_content_of(bytes: &[u8], cid: &Cid) -> bool {
 }
 
 fn io_error(error: std::io::Error) -> AdapterError {
-    AdapterError::Platform(format!("downloaded file: {error}"))
+    AdapterError::Transport(format!("downloaded file: {error}"))
 }
 
 fn failed(reason: String, retryable: bool) -> Outcome {

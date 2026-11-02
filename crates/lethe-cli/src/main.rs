@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
         filter: dev_filter(),
         backup: true,
         allow_incomplete_backup: false,
+        allow_lost_files: false,
     };
 
     store.create_run(&lethe_store::NewRun {

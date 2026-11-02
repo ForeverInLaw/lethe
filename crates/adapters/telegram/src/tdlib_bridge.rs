@@ -477,8 +477,11 @@ fn map_tdlib_error(error: types::Error) -> AdapterError {
 }
 
 /// A 404 here means the file is gone, not the message, so it must not read as
-/// "already deleted".
+/// "already deleted". A server fault says nothing about the file, so it can pass.
 fn map_download_error(error: types::Error) -> AdapterError {
+    if error.code >= 500 {
+        return AdapterError::Transport(format!("TDLib {}: {}", error.code, error.message));
+    }
     match map_tdlib_error(error) {
         AdapterError::NotFound => AdapterError::Platform("the file is no longer available".into()),
         other => other,

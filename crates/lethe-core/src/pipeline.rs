@@ -8,10 +8,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use lethe_adapter::{AdapterError, EnumeratePlan, Item, Outcome, PlatformAdapter};
+use lethe_adapter::{AdapterError, EnumeratePlan, FetchedMedia, Item, MediaRef, Outcome, PlatformAdapter};
 use lethe_crypto::receipt::{ReceiptSigner, RunSummary, SignedReceipt};
 use lethe_crypto::DataKey;
-use lethe_store::{ItemSnapshot, ItemState, PendingItem, PreviewCounts, RunState, Store};
+use lethe_store::{FileFailure, ItemSnapshot, ItemState, PendingItem, PreviewCounts, RunState, Store};
 
 use crate::archive::ArchiveWriter;
 use crate::filter::{FilterSpec, Predicate};
@@ -20,6 +20,10 @@ use crate::{EngineError, ProgressEvent, ProgressTx, Result, RunControl};
 
 const SNAPSHOT_FLUSH: usize = 500;
 const DELETE_BATCH: usize = 100;
+/// How long a file gets to come back from a network problem, one wait per retry.
+const FETCH_RETRY_DELAYS: [Duration; 3] =
+    [Duration::from_secs(2), Duration::from_secs(8), Duration::from_secs(30)];
+const STOP_POLL: Duration = Duration::from_millis(200);
 
 pub struct RunRequest {
     pub run_id: String,
@@ -32,6 +36,9 @@ pub struct RunRequest {
     /// The person agreed to delete items the backup cannot hold in full. Without
     /// this, such items stay on the platform.
     pub allow_incomplete_backup: bool,
+    /// The person agreed to delete items whose files the platform no longer hands
+    /// over. A file that is only out of reach for now keeps its item regardless.
+    pub allow_lost_files: bool,
 }
 
 /// Where the encrypted backup is written + the data-key that seals it. The
@@ -182,6 +189,7 @@ pub async fn execute(
 
         let mut deletable = Vec::with_capacity(batch.len());
         let mut records = Vec::new();
+        let mut file_failures = Vec::new();
         let mut retry_after_secs: Option<u64> = None;
 
         for item in &batch {
@@ -191,7 +199,7 @@ pub async fn execute(
                 continue;
             };
 
-            match archive_item(adapter.as_ref(), w, item, &control).await? {
+            match archive_item(adapter.as_ref(), w, item, req.allow_lost_files, &control).await? {
                 ArchiveResult::Stopped => return abort(writer),
                 ArchiveResult::Archived => {
                     archived.insert(platform_id.clone());
@@ -215,9 +223,13 @@ pub async fn execute(
                 }
                 ArchiveResult::FetchFailed(error) => {
                     outcome.failed += 1;
-                    let retryable = matches!(error, AdapterError::Transport(_));
+                    let failure = if is_lost_for_good(&error) {
+                        FileFailure::Unavailable
+                    } else {
+                        FileFailure::Unreachable
+                    };
                     let reason = format!("not backed up, so not deleted: {error}");
-                    records.push((platform_id.clone(), Outcome::Failed { reason, retryable }));
+                    file_failures.push((platform_id.clone(), failure, reason));
                 }
             }
         }
@@ -254,6 +266,9 @@ pub async fn execute(
         }
         if !records.is_empty() {
             store.record_outcomes(&req.run_id, &records)?;
+        }
+        if !file_failures.is_empty() {
+            store.record_file_failures(&req.run_id, &file_failures)?;
         }
 
         let _ = progress.send(ProgressEvent::Deleting {
@@ -306,25 +321,75 @@ enum ArchiveResult {
     FetchFailed(AdapterError),
 }
 
+/// Downloads one file, waiting out a network problem so that a blip does not cost
+/// the item its backup. `None` once the run has been stopped.
+async fn fetch_file(
+    adapter: &dyn PlatformAdapter,
+    item: &PendingItem,
+    media: &MediaRef,
+    control: &RunControl,
+) -> Option<std::result::Result<FetchedMedia, AdapterError>> {
+    let mut delays = FETCH_RETRY_DELAYS.iter();
+    loop {
+        if !keep_running(control).await {
+            return None;
+        }
+        let result = adapter.fetch_media(&item.item_ref, media).await;
+        match (&result, delays.next()) {
+            (Err(AdapterError::Transport(_)), Some(delay)) => {
+                if !wait(*delay, control).await {
+                    return None;
+                }
+            }
+            _ => return Some(result),
+        }
+    }
+}
+
+/// Sleeps in short steps, so a stop does not have to sit through the whole delay.
+/// False once the run has been stopped.
+async fn wait(delay: Duration, control: &RunControl) -> bool {
+    let until = tokio::time::Instant::now() + delay;
+    while tokio::time::Instant::now() < until {
+        if control.is_stopped() {
+            return false;
+        }
+        tokio::time::sleep_until(until.min(tokio::time::Instant::now() + STOP_POLL)).await;
+    }
+    true
+}
+
+/// The platform answered and refused the file. Anything else may pass with time.
+fn is_lost_for_good(error: &AdapterError) -> bool {
+    matches!(error, AdapterError::Platform(_) | AdapterError::Unsupported(_))
+}
+
 /// Downloads an item's files and archives them with its record. Unless the result
-/// is `Archived`, nothing was written and the item must not be deleted. An error
-/// means the archive itself failed and the run must end.
+/// is `Archived`, nothing was written and the item must not be deleted. With
+/// `allow_lost_files`, a file lost for good leaves a hole in the record instead. An
+/// error means the archive itself failed and the run must end.
 async fn archive_item(
     adapter: &dyn PlatformAdapter,
     writer: &mut ArchiveWriter,
     item: &PendingItem,
+    allow_lost_files: bool,
     control: &RunControl,
 ) -> Result<ArchiveResult> {
     let mut files = Vec::with_capacity(item.media.len());
+    let mut lost = Vec::new();
     let mut result = ArchiveResult::Archived;
     for media in &item.media {
-        if !keep_running(control).await {
-            result = ArchiveResult::Stopped;
-            break;
-        }
-        match adapter.fetch_media(&item.item_ref, media).await {
-            Ok(file) => files.push(file),
-            Err(error) => {
+        match fetch_file(adapter, item, media, control).await {
+            None => {
+                result = ArchiveResult::Stopped;
+                break;
+            }
+            Some(Ok(file)) => files.push(Some(file)),
+            Some(Err(error)) if allow_lost_files && is_lost_for_good(&error) => {
+                files.push(None);
+                lost.push(error.to_string());
+            }
+            Some(Err(error)) => {
                 result = ArchiveResult::FetchFailed(error);
                 break;
             }
@@ -332,10 +397,10 @@ async fn archive_item(
     }
 
     let written = match result {
-        ArchiveResult::Archived => writer.write_item(item, &files),
+        ArchiveResult::Archived => writer.write_item(item, &files, &lost),
         _ => Ok(()),
     };
-    for file in &files {
+    for file in files.iter().flatten() {
         if let Err(error) = adapter.release_media(file).await {
             tracing::warn!(%error, "could not remove a downloaded media file");
         }
@@ -343,6 +408,9 @@ async fn archive_item(
     written?;
     Ok(result)
 }
+
+#[cfg(test)]
+mod file_failure_tests;
 
 #[cfg(test)]
 mod tests {
@@ -354,7 +422,6 @@ mod tests {
         RatePolicy, RiskClass,
     };
     use crate::archive::audit_archive;
-    use lethe_adapter::{FetchedMedia, MediaRef};
     use lethe_crypto::container::ContainerReader;
     use std::fs::File;
     use std::sync::Mutex;
@@ -489,6 +556,7 @@ mod tests {
             filter: match_all_filter(),
             backup: true,
             allow_incomplete_backup: false,
+            allow_lost_files: false,
         };
         store
             .create_run(&NewRun {
@@ -582,6 +650,7 @@ mod tests {
             filter: match_all_filter(),
             backup: false,
             allow_incomplete_backup: false,
+            allow_lost_files: false,
         };
         store
             .create_run(&NewRun {
@@ -636,6 +705,7 @@ mod tests {
             filter: match_all_filter(),
             backup: false,
             allow_incomplete_backup: false,
+            allow_lost_files: false,
         };
         store
             .create_run(&NewRun {
@@ -670,7 +740,7 @@ mod tests {
     }
 
     /// Adapter whose items carry files, with scripted fetches and a call journal.
-    struct MediaAdapter {
+    pub(super) struct MediaAdapter {
         inner: FakeAdapter,
         items: Vec<Item>,
         fetch: Box<dyn Fn(&MediaRef, usize) -> std::result::Result<FetchedMedia, AdapterError> + Send + Sync>,
@@ -680,7 +750,7 @@ mod tests {
     }
 
     impl MediaAdapter {
-        fn new(
+        pub(super) fn new(
             items: Vec<Item>,
             fetch: impl Fn(&MediaRef, usize) -> std::result::Result<FetchedMedia, AdapterError> + Send + Sync + 'static,
         ) -> Self {
@@ -694,7 +764,7 @@ mod tests {
             }
         }
 
-        fn journal(&self) -> Vec<String> {
+        pub(super) fn journal(&self) -> Vec<String> {
             self.journal.lock().unwrap().clone()
         }
 
@@ -747,7 +817,7 @@ mod tests {
         }
     }
 
-    fn media_item(id: &str, files: &[(&str, u64)]) -> Item {
+    pub(super) fn media_item(id: &str, files: &[(&str, u64)]) -> Item {
         Item {
             content_type: ContentType::Media,
             created_at: None,
@@ -770,23 +840,28 @@ mod tests {
     }
 
     /// Writes a downloaded file for an adapter to hand over.
-    fn downloaded(bytes: &[u8]) -> FetchedMedia {
+    pub(super) fn downloaded(bytes: &[u8]) -> FetchedMedia {
         let path = std::env::temp_dir().join(format!("lethe-media-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, bytes).unwrap();
         FetchedMedia { path, handle: 1 }
     }
 
-    struct MediaRun {
-        outcome: Result<RunOutcome>,
-        store: Store,
+    pub(super) struct MediaRun {
+        pub(super) outcome: Result<RunOutcome>,
+        pub(super) store: Store,
         events: Vec<ProgressEvent>,
-        archive: PathBuf,
+        pub(super) archive: PathBuf,
     }
 
-    const ARCHIVE_KEY: DataKey = [5u8; 32];
+    pub(super) const ARCHIVE_KEY: DataKey = [5u8; 32];
 
-    async fn run_media(adapter: Arc<MediaAdapter>, control: RunControl) -> MediaRun {
+    pub(super) async fn run_media(adapter: Arc<MediaAdapter>, control: RunControl) -> MediaRun {
         run_media_with_consent(adapter, control, false).await
+    }
+
+    /// A run in which the person agreed to delete items that lost a file.
+    pub(super) async fn run_media_allowing_lost_files(adapter: Arc<MediaAdapter>) -> MediaRun {
+        run_media_request(adapter, RunControl::new(), false, true, true).await
     }
 
     async fn run_media_with_consent(
@@ -803,6 +878,16 @@ mod tests {
         allow_incomplete_backup: bool,
         with_backup: bool,
     ) -> MediaRun {
+        run_media_request(adapter, control, allow_incomplete_backup, false, with_backup).await
+    }
+
+    async fn run_media_request(
+        adapter: Arc<MediaAdapter>,
+        control: RunControl,
+        allow_incomplete_backup: bool,
+        allow_lost_files: bool,
+        with_backup: bool,
+    ) -> MediaRun {
         let mut store = Store::open_in_memory("test-key").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let req = RunRequest {
@@ -814,6 +899,7 @@ mod tests {
             filter: match_all_filter(),
             backup: true,
             allow_incomplete_backup,
+            allow_lost_files,
         };
         store
             .create_run(&NewRun {
@@ -850,7 +936,7 @@ mod tests {
     }
 
     impl MediaRun {
-        fn audit(&self) -> crate::archive::ArchiveAudit {
+        pub(super) fn audit(&self) -> crate::archive::ArchiveAudit {
             audit_archive(File::open(&self.archive).unwrap(), &ARCHIVE_KEY).unwrap()
         }
 
