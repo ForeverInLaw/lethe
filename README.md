@@ -55,6 +55,13 @@ opens a follow-up run for those items. With `RunRequest::allow_lost_files`, an i
 a file when the adapter reports `AdapterError::FileRefused`, and its backup entry says so. Any
 other download error keeps the item.
 
+Telegram reports for each message how far a delete can go. The scan records that as
+`Item::delete_reach`, and delete checks it again, so a message whose rights changed since
+the preview stays and counts as failed. A message other people would keep seeing is
+deleted only with `RunRequest::allow_only_for_self`, and the receipt counts it apart. One
+Telegram will not delete at all is never touched. Saved Messages count as deleted for
+everyone, because nobody else sees them.
+
 In the desktop app, a Bluesky post goes into the backup with its text and every file
 it owns: images, video, captions and link card thumbnails, along with the whole record
 the platform returned, so alt text, links and quotes stay too. A post whose file cannot

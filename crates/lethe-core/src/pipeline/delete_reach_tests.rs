@@ -53,6 +53,15 @@ async fn with_consent_it_also_goes_for_this_account_and_is_counted_apart() {
     assert_eq!(adapter.journal(), ["delete for-everyone", "delete only-mine"]);
 }
 
+#[tokio::test]
+async fn a_run_without_a_receipt_still_tells_what_others_can_see() {
+    let run = run_media_allowing_only_for_self(no_files(mixed_chat())).await;
+
+    let runs = run.store.runs_without_receipt().unwrap();
+
+    assert_eq!((runs[0].deleted, runs[0].deleted_only_for_self), (2, 1));
+}
+
 /// A run stopped at the preview, where the person can still change what goes.
 async fn previewed(items: Vec<Item>) -> Store {
     let store = Store::open_in_memory("test-key").unwrap();

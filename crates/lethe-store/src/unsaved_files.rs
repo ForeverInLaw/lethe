@@ -190,7 +190,7 @@ mod tests {
                 }],
                 platform_record: Some(PlatformRecord::from_json(format!("{{\"id\":\"{id}\"}}")).unwrap()),
                 backup_gap: Some("poll votes are missing".into()),
-                delete_reach: Default::default(),
+                delete_reach: lethe_adapter::DeleteReach::Everyone,
                 state: ItemState::Pending,
             })
             .collect();

@@ -29,7 +29,8 @@ pub fn message_token(chat_id: i64, message_id: i64, reach: DeleteReach) -> Strin
 }
 
 /// Parse a Telegram `ItemRef` back into `(chat_id, message_id)`. Accepts both
-/// the `token` form (`"{chat}:{message}"`) and the `platform_id` form
+/// the `token` form (`"{chat}:{message}"`, with `":self"` after a message previewed as
+/// going only for this account) and the `platform_id` form
 /// (`"telegram:{chat}:{message}"`). Returns `None` for anything malformed so
 /// the caller can mark just that row failed instead of poisoning the batch.
 pub fn parse_message_ref(item: &ItemRef) -> Option<(i64, i64)> {

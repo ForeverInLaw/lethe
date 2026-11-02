@@ -31,7 +31,8 @@ pub struct ItemSnapshot {
     pub platform_record: Option<PlatformRecord>,
     pub backup_gap: Option<String>,
     pub delete_reach: DeleteReach,
-    /// `protected` when matched by the allow-list/pin predicate, else `pending`.
+    /// `protected` when matched by the allow-list/pin predicate, `undeletable` when the
+    /// platform will not delete it, else `pending`.
     pub state: ItemState,
 }
 
@@ -123,6 +124,8 @@ pub struct RunWithoutReceipt {
     pub account: String,
     pub started_secs: i64,
     pub deleted: u64,
+    /// How many of `deleted` other people can still see.
+    pub deleted_only_for_self: u64,
 }
 
 pub struct Store {
@@ -488,7 +491,9 @@ impl Store {
     pub fn runs_without_receipt(&self) -> Result<Vec<RunWithoutReceipt>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT r.run_id, r.platform, r.account, r.started,
-                    (SELECT COUNT(*) FROM items i WHERE i.run_id = r.run_id AND i.state = 'deleted')
+                    (SELECT COUNT(*) FROM items i WHERE i.run_id = r.run_id AND i.state = 'deleted'),
+                    (SELECT COUNT(*) FROM items i WHERE i.run_id = r.run_id AND i.state = 'deleted'
+                        AND i.delete_reach = 'only_for_self')
              FROM runs r
              WHERE r.state NOT IN ('enumerating', 'preview')
                AND NOT EXISTS (SELECT 1 FROM receipts c WHERE c.run_id = r.run_id)
@@ -501,6 +506,7 @@ impl Store {
                 account: row.get(2)?,
                 started_secs: row.get(3)?,
                 deleted: row.get::<_, i64>(4)? as u64,
+                deleted_only_for_self: row.get::<_, i64>(5)? as u64,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -804,6 +810,7 @@ mod tests {
                     account: "a".into(),
                     started_secs: 4,
                     deleted: 1,
+                    deleted_only_for_self: 0,
                 },
                 RunWithoutReceipt {
                     run_id: "older".into(),
@@ -811,6 +818,7 @@ mod tests {
                     account: "a".into(),
                     started_secs: 3,
                     deleted: 0,
+                    deleted_only_for_self: 0,
                 },
             ]
         );

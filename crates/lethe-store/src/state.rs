@@ -38,9 +38,9 @@ pub(crate) fn reach_as_str(reach: DeleteReach) -> &'static str {
 
 pub(crate) fn reach_from_stored(stored: &str) -> DeleteReach {
     match stored {
+        "everyone" => DeleteReach::Everyone,
         "only_for_self" => DeleteReach::OnlyForSelf,
-        "nowhere" => DeleteReach::Nowhere,
-        _ => DeleteReach::Everyone,
+        _ => DeleteReach::Nowhere,
     }
 }
 

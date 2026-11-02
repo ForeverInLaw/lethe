@@ -489,7 +489,7 @@ mod tests {
                         media: vec![],
                         platform_record: None,
                         backup_gap: None,
-                        delete_reach: Default::default(),
+                        delete_reach: DeleteReach::Everyone,
                         item_ref: ItemRef {
                             platform_id: format!("at://fake/app.bsky.feed.post/{i}"),
                             token: Some(format!("app.bsky.feed.post:{i}")),
@@ -857,7 +857,7 @@ mod tests {
                 .collect(),
             platform_record: None,
             backup_gap: None,
-            delete_reach: Default::default(),
+            delete_reach: DeleteReach::Everyone,
             item_ref: ItemRef { platform_id: id.into(), token: None },
         }
     }

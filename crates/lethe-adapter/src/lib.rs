@@ -239,10 +239,9 @@ pub struct Item {
 }
 
 /// How far a delete of one item goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteReach {
     /// The item is gone for everyone who could see it.
-    #[default]
     Everyone,
     /// Only this account stops seeing it; everyone else still does. Such an item is
     /// deleted only if the person agrees to that.
