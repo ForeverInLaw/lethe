@@ -19,7 +19,7 @@ use lethe_crypto::DataKey;
 use time::macros::format_description;
 use time::OffsetDateTime;
 
-use super::{corrupt, io_error, ArchiveWalk, CopyFailure, ReadMedia, ReadRecord};
+use super::{corrupt, io_error, ArchiveWalk, CopyFailure, ReadMedia, ReadRecord, StoredFile};
 use crate::{EngineError, Result};
 
 /// Leaves room for a number and `.part` under the 255 bytes file systems allow.
@@ -141,10 +141,10 @@ impl ExportFolder {
             .media
             .iter()
             .enumerate()
-            .filter(|(_, media)| media.chunks > 0);
-        for (index, media) in stored {
+            .filter_map(|(index, media)| Some((index, media, media.stored.as_ref()?)));
+        for (index, media, stored) in stored {
             let wanted = export_file_name(record, media, index);
-            match self.add_file(walk, media, &wanted)? {
+            match self.add_file(walk, stored, &wanted)? {
                 SavedFile::Whole(name) => {
                     report.media_files += 1;
                     names.push(name);
@@ -164,13 +164,13 @@ impl ExportFolder {
     fn add_file<R: Read>(
         &self,
         walk: &mut ArchiveWalk<R>,
-        media: &ReadMedia,
+        stored: &StoredFile,
         wanted: &str,
     ) -> Result<SavedFile> {
         let (file, name) =
             claim_name(wanted, |name| File::create_new(self.files.join(name))).map_err(io_error)?;
         let mut out = BufWriter::new(file);
-        let copied = walk.copy_file(media, &mut out);
+        let copied = walk.copy_file(stored, &mut out);
         out.flush().map_err(io_error)?;
         drop(out);
         match copied {

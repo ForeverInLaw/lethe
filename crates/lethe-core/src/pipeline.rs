@@ -1241,6 +1241,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_file_comes_back_out_of_the_backup() {
+        let adapter = Arc::new(MediaAdapter::new(vec![media_item("m1", &[("empty", 0)])], |_, _| {
+            Ok(downloaded(b""))
+        }));
+
+        let run = run_media(adapter, RunControl::new()).await;
+
+        assert_eq!(run.audit().media_files, 1);
+        let (report, messages) = exported(&run);
+        assert_eq!(report.media_files, 1);
+        assert_eq!(std::fs::read(report.folder.join("files/empty.jpg")).unwrap(), b"");
+        assert!(messages.contains("files/empty.jpg"), "{messages}");
+        std::fs::remove_dir_all(report.folder.parent().unwrap()).unwrap();
+    }
+
+    #[tokio::test]
     async fn a_stopped_run_exports_what_it_got_to() {
         let control = RunControl::new();
         let stop = control.clone();
