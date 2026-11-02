@@ -24,6 +24,8 @@ CREATE TABLE IF NOT EXISTS items (
     token        TEXT,               -- opaque adapter delete-routing
     text         TEXT,               -- Phase-1 text snapshot for backup
     media_json   TEXT    NOT NULL DEFAULT '[]',
+    platform_record TEXT,            -- the item as the platform returned it, until it ran
+    backup_gap   TEXT,               -- why the backup cannot hold all of it
     state        TEXT    NOT NULL,   -- pending | protected | deleted | skipped | failed
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_error   TEXT,

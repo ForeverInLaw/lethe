@@ -4,7 +4,7 @@
 //! native TDLib. Use `tdlib-docs` with `cargo check` to type-check generated
 //! TDLib bindings; test binaries still need native tdjson symbols.
 
-use lethe_adapter::{AdapterError, FetchedMedia, MediaRef};
+use lethe_adapter::{AdapterError, FetchedMedia, MediaRef, PlatformRecord};
 use tdlib_rs::{enums, functions, types};
 
 const CHAT_LOAD_PAGE: i32 = 100;
@@ -78,6 +78,10 @@ pub struct TelegramMessageRef {
     /// Message text or media caption, kept in the backup with the message.
     pub text: Option<String>,
     pub media: Vec<MediaRef>,
+    /// The whole message, which is all the backup has of a poll, contact or location.
+    pub platform_record: PlatformRecord,
+    /// What TDLib does not hand over, so the backup cannot hold it.
+    pub backup_gap: Option<String>,
 }
 
 /// One page of the user's own messages in a chat, newest first.
@@ -169,18 +173,24 @@ pub async fn search_own_messages(
             .messages
             .into_iter()
             .filter(|message| is_from_user(message, current_user_id))
-            .map(|message| TelegramMessageRef {
-                chat_id: message.chat_id,
-                message_id: message.id,
-                sent_at_epoch_secs: message.date,
-                kind: classify_message_content(&message.content),
-                text: extract_message_text(&message.content),
-                media: message_files(&message.content)
-                    .into_iter()
-                    .map(Attachment::into_media_ref)
-                    .collect(),
-            })
+            .map(|message| message_ref(&message))
+            .collect::<Result<_, _>>()?,
+    })
+}
+
+fn message_ref(message: &types::Message) -> Result<TelegramMessageRef, AdapterError> {
+    Ok(TelegramMessageRef {
+        chat_id: message.chat_id,
+        message_id: message.id,
+        sent_at_epoch_secs: message.date,
+        kind: classify_message_content(&message.content),
+        text: extract_message_text(&message.content),
+        media: message_files(&message.content)
+            .into_iter()
+            .map(Attachment::into_media_ref)
             .collect(),
+        platform_record: PlatformRecord::capture(message)?,
+        backup_gap: backup_gap(&message.content).map(str::to_owned),
     })
 }
 
@@ -351,8 +361,26 @@ impl<'a> Attachment<'a> {
     }
 }
 
-/// The files worth keeping from a message. Expired media and previews of paid
-/// media have none, so such a message backs up as its metadata alone.
+/// What the message holds that TDLib does not hand over. Expired media is not on
+/// the list: Telegram no longer has it, so a delete takes nothing away.
+fn backup_gap(content: &enums::MessageContent) -> Option<&'static str> {
+    match content {
+        enums::MessageContent::MessageUnsupported => {
+            Some("this version of TDLib cannot read this kind of message")
+        }
+        enums::MessageContent::MessagePhoto(media) if largest_photo(&media.photo).is_none() => {
+            Some("Telegram does not hand over this photo")
+        }
+        enums::MessageContent::MessagePaidMedia(media)
+            if media.media.iter().any(|paid| paid_media_file(paid).is_none()) =>
+        {
+            Some("Telegram does not hand over this paid media")
+        }
+        _ => None,
+    }
+}
+
+/// The files worth keeping from a message.
 fn message_files(content: &enums::MessageContent) -> Vec<Attachment<'_>> {
     match content {
         enums::MessageContent::MessageAnimation(media) => {
@@ -564,6 +592,157 @@ mod tests {
             has_spoiler: false,
             is_secret: false,
         })
+    }
+
+    fn message_with(content: enums::MessageContent) -> types::Message {
+        types::Message {
+            id: 9,
+            sender_id: enums::MessageSender::User(types::MessageSenderUser { user_id: 1 }),
+            chat_id: 7,
+            sending_state: None,
+            scheduling_state: None,
+            is_outgoing: true,
+            is_pinned: false,
+            is_from_offline: false,
+            can_be_saved: true,
+            has_timestamped_media: false,
+            is_channel_post: false,
+            is_paid_star_suggested_post: false,
+            is_paid_ton_suggested_post: false,
+            contains_unread_mention: false,
+            date: 100,
+            edit_date: 0,
+            forward_info: None,
+            import_info: None,
+            interaction_info: None,
+            unread_reactions: Vec::new(),
+            fact_check: None,
+            suggested_post_info: None,
+            reply_to: None,
+            topic_id: None,
+            self_destruct_type: None,
+            self_destruct_in: 0.0,
+            auto_delete_in: 0.0,
+            via_bot_user_id: 0,
+            sender_business_bot_user_id: 0,
+            sender_boost_count: 0,
+            paid_message_star_count: 0,
+            author_signature: String::new(),
+            media_album_id: 0,
+            effect_id: 0,
+            restriction_info: None,
+            summary_language_code: String::new(),
+            content,
+            reply_markup: None,
+        }
+    }
+
+    fn record_of(content: enums::MessageContent) -> serde_json::Value {
+        let message = message_ref(&message_with(content)).unwrap();
+        serde_json::from_str(message.platform_record.as_json()).unwrap()
+    }
+
+    fn gap_of(content: enums::MessageContent) -> Option<String> {
+        message_ref(&message_with(content)).unwrap().backup_gap
+    }
+
+    #[test]
+    fn a_contact_is_kept_in_the_platform_record() {
+        let record = record_of(enums::MessageContent::MessageContact(types::MessageContact {
+            contact: types::Contact {
+                phone_number: "+15550100".into(),
+                first_name: "Sam".into(),
+                last_name: String::new(),
+                vcard: String::new(),
+                user_id: 0,
+            },
+        }));
+        assert_eq!(record["content"]["contact"]["phone_number"], "+15550100");
+        assert_eq!(record["content"]["contact"]["first_name"], "Sam");
+    }
+
+    #[test]
+    fn a_location_is_kept_in_the_platform_record() {
+        let record = record_of(enums::MessageContent::MessageLocation(types::MessageLocation {
+            location: types::Location {
+                latitude: 52.5,
+                longitude: 13.4,
+                horizontal_accuracy: 0.0,
+            },
+            live_period: 0,
+            expires_in: 0,
+            heading: 0,
+            proximity_alert_radius: 0,
+        }));
+        assert_eq!(record["content"]["location"]["latitude"], 52.5);
+    }
+
+    #[test]
+    fn a_poll_is_kept_in_the_platform_record_and_has_nothing_missing() {
+        let content = enums::MessageContent::MessagePoll(types::MessagePoll {
+            poll: types::Poll {
+                id: 1,
+                question: caption("tea or coffee"),
+                options: vec![types::PollOption {
+                    text: caption("tea"),
+                    voter_count: 2,
+                    vote_percentage: 100,
+                    is_chosen: false,
+                    is_being_chosen: false,
+                }],
+                total_voter_count: 2,
+                recent_voter_ids: Vec::new(),
+                is_anonymous: true,
+                r#type: enums::PollType::Regular(types::PollTypeRegular {
+                    allow_multiple_answers: false,
+                }),
+                open_period: 0,
+                close_date: 0,
+                is_closed: false,
+            },
+        });
+
+        assert_eq!(gap_of(content.clone()), None);
+        let record = record_of(content);
+        assert_eq!(record["content"]["poll"]["question"]["text"], "tea or coffee");
+        assert_eq!(record["content"]["poll"]["options"][0]["text"]["text"], "tea");
+    }
+
+    #[test]
+    fn a_message_tdlib_cannot_read_lacks_its_content() {
+        assert!(gap_of(enums::MessageContent::MessageUnsupported).is_some());
+    }
+
+    #[test]
+    fn a_photo_without_sizes_lacks_its_file() {
+        assert!(gap_of(photo_message(&[])).is_some());
+        assert_eq!(gap_of(photo_message(&[(90, "small")])), None);
+    }
+
+    #[test]
+    fn paid_media_lacks_a_file_when_any_of_its_entries_has_none() {
+        let paid = |media| {
+            enums::MessageContent::MessagePaidMedia(types::MessagePaidMedia {
+                star_count: 1,
+                media,
+                caption: caption("paid"),
+                show_caption_above_media: false,
+            })
+        };
+        let photo = || {
+            let enums::MessageContent::MessagePhoto(message) = photo_message(&[(90, "small")]) else {
+                unreachable!()
+            };
+            enums::PaidMedia::Photo(types::PaidMediaPhoto { photo: message.photo })
+        };
+
+        assert_eq!(gap_of(paid(vec![photo()])), None);
+        assert!(gap_of(paid(vec![photo(), enums::PaidMedia::Unsupported])).is_some());
+    }
+
+    #[test]
+    fn expired_media_has_nothing_left_to_lose() {
+        assert_eq!(gap_of(enums::MessageContent::MessageExpiredPhoto), None);
     }
 
     #[test]

@@ -29,6 +29,9 @@ pub struct RunRequest {
     pub plan: EnumeratePlan,
     pub filter: FilterSpec,
     pub backup: bool,
+    /// The person agreed to delete items the backup cannot hold in full. Without
+    /// this, such items stay on the platform.
+    pub allow_incomplete_backup: bool,
 }
 
 /// Where the encrypted backup is written + the data-key that seals it. The
@@ -105,6 +108,8 @@ pub async fn snapshot(
                 created_at_secs: item.created_at.map(|t| t.unix_timestamp()),
                 text: item.text.clone(),
                 media: item.media.clone(),
+                platform_record: item.platform_record.clone(),
+                backup_gap: item.backup_gap.clone(),
                 state,
             });
         }
@@ -150,6 +155,9 @@ pub async fn execute(
         (Some(target), true) => Some(ArchiveWriter::create(target, req)?),
         _ => None,
     };
+    if !req.allow_incomplete_backup {
+        store.protect_backup_gaps(&req.run_id)?;
+    }
 
     // From here on the preview is final: `set_item_protected` refuses, and every
     // protection committed before this line is seen by the first claim.
@@ -342,7 +350,7 @@ mod tests {
     use async_trait::async_trait;
     use futures::stream;
     use lethe_adapter::{
-        AdapterError, Capabilities, ContentType, Descriptor, Engagement, ItemRef, ItemStream,
+        AdapterError, Capabilities, ContentType, Descriptor, Engagement, ItemRef, ItemStream, PlatformRecord,
         RatePolicy, RiskClass,
     };
     use crate::archive::audit_archive;
@@ -395,6 +403,8 @@ mod tests {
                         engagement: Engagement::default(),
                         scope_id: None,
                         media: vec![],
+                        platform_record: None,
+                        backup_gap: None,
                         item_ref: ItemRef {
                             platform_id: format!("at://fake/app.bsky.feed.post/{i}"),
                             token: Some(format!("app.bsky.feed.post:{i}")),
@@ -478,6 +488,7 @@ mod tests {
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
             backup: true,
+            allow_incomplete_backup: false,
         };
         store
             .create_run(&NewRun {
@@ -570,6 +581,7 @@ mod tests {
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
             backup: false,
+            allow_incomplete_backup: false,
         };
         store
             .create_run(&NewRun {
@@ -623,6 +635,7 @@ mod tests {
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
             backup: false,
+            allow_incomplete_backup: false,
         };
         store
             .create_run(&NewRun {
@@ -750,6 +763,8 @@ mod tests {
                     size: Some(*size),
                 })
                 .collect(),
+            platform_record: None,
+            backup_gap: None,
             item_ref: ItemRef { platform_id: id.into(), token: None },
         }
     }
@@ -771,6 +786,23 @@ mod tests {
     const ARCHIVE_KEY: DataKey = [5u8; 32];
 
     async fn run_media(adapter: Arc<MediaAdapter>, control: RunControl) -> MediaRun {
+        run_media_with_consent(adapter, control, false).await
+    }
+
+    async fn run_media_with_consent(
+        adapter: Arc<MediaAdapter>,
+        control: RunControl,
+        allow_incomplete_backup: bool,
+    ) -> MediaRun {
+        run_media_on(adapter, control, allow_incomplete_backup, true).await
+    }
+
+    async fn run_media_on(
+        adapter: Arc<MediaAdapter>,
+        control: RunControl,
+        allow_incomplete_backup: bool,
+        with_backup: bool,
+    ) -> MediaRun {
         let mut store = Store::open_in_memory("test-key").unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let req = RunRequest {
@@ -781,6 +813,7 @@ mod tests {
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
             backup: true,
+            allow_incomplete_backup,
         };
         store
             .create_run(&NewRun {
@@ -800,7 +833,7 @@ mod tests {
             &req,
             control,
             &tx,
-            Some(BackupTarget { path: archive.clone(), key: ARCHIVE_KEY }),
+            with_backup.then(|| BackupTarget { path: archive.clone(), key: ARCHIVE_KEY }),
         )
         .await;
         let mut events = Vec::new();
@@ -858,6 +891,81 @@ mod tests {
             event,
             ProgressEvent::Archiving { done_bytes, total_bytes } if *done_bytes == *total_bytes && *total_bytes == bytes.len() as u64
         )));
+    }
+
+    #[tokio::test]
+    async fn the_platform_record_reaches_the_archive_before_the_delete() {
+        let poll = Item {
+            platform_record: Some(
+                PlatformRecord::from_json(r#"{"question":"tea or coffee","votes":[3,4]}"#.into()).unwrap(),
+            ),
+            ..media_item("poll", &[])
+        };
+        let adapter = Arc::new(MediaAdapter::new(vec![poll, media_item("plain", &[])], |_, _| {
+            Ok(downloaded(b""))
+        }));
+
+        let run = run_media(adapter.clone(), RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 2, skipped: 0, failed: 0 });
+        let records: Vec<serde_json::Value> = run.chunks()[1..]
+            .iter()
+            .map(|chunk| serde_json::from_slice(chunk).unwrap())
+            .collect();
+        let of = |id: &str| records.iter().find(|record| record["platform_id"] == id).unwrap();
+        assert_eq!(of("poll")["platform_record"]["question"], "tea or coffee");
+        assert_eq!(of("poll")["platform_record"]["votes"][1], 4);
+        assert!(of("plain").get("platform_record").is_none());
+        assert_eq!(run.audit().items, 2);
+    }
+
+    fn item_with_a_gap(id: &str) -> Item {
+        Item {
+            backup_gap: Some("Telegram does not hand over this file".into()),
+            ..media_item(id, &[("photo", 3)])
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_the_backup_cannot_hold_stays_without_consent() {
+        let adapter = Arc::new(MediaAdapter::new(
+            vec![item_with_a_gap("gap"), media_item("whole", &[])],
+            |_, _| Ok(downloaded(b"abc")),
+        ));
+
+        let run = run_media(adapter.clone(), RunControl::new()).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(adapter.journal(), ["delete whole"]);
+        assert_eq!(run.store.preview_counts("media").unwrap().protected, 1);
+        assert_eq!(run.audit().items, 1);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_backup_at_all_still_needs_consent_for_such_an_item() {
+        let adapter = Arc::new(MediaAdapter::new(vec![item_with_a_gap("gap")], |_, _| {
+            Ok(downloaded(b"abc"))
+        }));
+
+        let run = run_media_on(adapter.clone(), RunControl::new(), false, false).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 0 });
+        assert!(adapter.journal().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_item_the_backup_cannot_hold_goes_with_consent_and_says_what_is_missing() {
+        let adapter = Arc::new(MediaAdapter::new(vec![item_with_a_gap("gap")], |_, _| {
+            Ok(downloaded(b"abc"))
+        }));
+
+        let run = run_media_with_consent(adapter.clone(), RunControl::new(), true).await;
+
+        assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0 });
+        assert_eq!(adapter.journal(), ["fetch photo", "release 1", "delete gap"]);
+        let record: serde_json::Value = serde_json::from_slice(&run.chunks()[1]).unwrap();
+        assert_eq!(record["backup_gap"], "Telegram does not hand over this file");
+        assert_eq!(run.audit().media_files, 1);
     }
 
     #[tokio::test]

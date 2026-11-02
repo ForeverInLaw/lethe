@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use time::OffsetDateTime;
 
 pub type Result<T> = std::result::Result<T, AdapterError>;
@@ -162,6 +163,38 @@ pub struct MediaRef {
     pub size: Option<u64>,
 }
 
+/// An item exactly as the platform returned it, as JSON. It goes into the backup
+/// whole, so what the person wrote survives even where no other field has a place
+/// for it: a poll, a contact, an image's alt text.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct PlatformRecord(Box<RawValue>);
+
+impl PlatformRecord {
+    pub fn capture(record: &impl Serialize) -> Result<Self> {
+        serde_json::value::to_raw_value(record)
+            .map(Self)
+            .map_err(|e| AdapterError::Platform(format!("unreadable record: {e}")))
+    }
+
+    /// Restores a record from what `as_json` returned.
+    pub fn from_json(json: String) -> std::result::Result<Self, serde_json::Error> {
+        RawValue::from_string(json).map(Self)
+    }
+
+    pub fn as_json(&self) -> &str {
+        self.0.get()
+    }
+}
+
+impl PartialEq for PlatformRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_json() == other.as_json()
+    }
+}
+
+impl Eq for PlatformRecord {}
+
 /// A media file downloaded to local disk, ready to be archived.
 #[derive(Debug, Clone)]
 pub struct FetchedMedia {
@@ -179,7 +212,7 @@ pub struct ItemRef {
     pub token: Option<String>,
 }
 
-/// Enumerated metadata. In-memory only (not serialized here); the store
+/// An enumerated item. In-memory only (not serialized here); the store
 /// persists its own projection.
 #[derive(Debug, Clone)]
 pub struct Item {
@@ -191,6 +224,11 @@ pub struct Item {
     pub scope_id: Option<String>,
     /// Media to fetch into the encrypted backup before deletion.
     pub media: Vec<MediaRef>,
+    /// The whole item as the platform returned it, for the backup.
+    pub platform_record: Option<PlatformRecord>,
+    /// Why the backup cannot hold all of this item, when the scan already knows.
+    /// Such an item is deleted only if the person agrees to that.
+    pub backup_gap: Option<String>,
     pub item_ref: ItemRef,
 }
 
