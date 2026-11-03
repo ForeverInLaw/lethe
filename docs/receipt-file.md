@@ -19,8 +19,9 @@ its own Ed25519 key. Anyone can check the file without the app.
   encoding it again can change its bytes, so check the string as it is.
 - `signature_hex` is a detached Ed25519 signature over the UTF-8 bytes of
   `summary`, made with the key in `public_key_hex`.
-- Fields in `summary` that are zero may be absent. Its fields are described on
-  `RunSummary` in `crates/lethe-crypto/src/receipt.rs`.
+- `deleted_only_for_self`, `kept_only_for_self` and `undeletable` are left out of
+  `summary` when they are zero; every other field is always there. The fields are
+  described on `RunSummary` in `crates/lethe-crypto/src/receipt.rs`.
 
 A valid signature proves that the holder of that key signed this summary and that
 the summary has not been edited since. Every receipt from one install carries the
