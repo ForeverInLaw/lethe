@@ -16,14 +16,13 @@ use lethe_store::{Consents, FileFailure, ItemSnapshot, ItemState, PendingItem, P
 use crate::archive::ArchiveWriter;
 use crate::filter::{FilterSpec, Predicate};
 use crate::scheduler::Scheduler;
-use crate::{EngineError, ProgressEvent, ProgressTx, Result, RunControl};
+use crate::{EngineError, ProgressEvent, ProgressTx, Result, RunControl, STOP_POLL};
 
 const SNAPSHOT_FLUSH: usize = 500;
 const DELETE_BATCH: usize = 100;
 /// How long a file gets to come back from a network problem, one wait per retry.
 const FETCH_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_secs(2), Duration::from_secs(8), Duration::from_secs(30)];
-const STOP_POLL: Duration = Duration::from_millis(200);
 /// How often a run held by an outage asks whether the platform answers again.
 const CONNECTION_POLL: Duration = Duration::from_secs(10);
 
@@ -450,14 +449,7 @@ async fn wait_for_connection(adapter: &dyn PlatformAdapter, control: &RunControl
 async fn reachable(adapter: &dyn PlatformAdapter, control: &RunControl) -> Option<bool> {
     tokio::select! {
         answer = adapter.is_reachable() => Some(answer),
-        () = stopped(control) => None,
-    }
-}
-
-/// Completes once the run has been stopped.
-async fn stopped(control: &RunControl) {
-    while !control.is_stopped() {
-        tokio::time::sleep(STOP_POLL).await;
+        () = control.stopped() => None,
     }
 }
 
