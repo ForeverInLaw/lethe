@@ -138,7 +138,7 @@ async fn an_item_that_stayed_is_listed_with_why() {
 
     let unsaved = run.store.unsaved_files("media").unwrap();
     assert_eq!((unsaved.total, unsaved.unavailable), (2, 1));
-    let items = run.store.unsaved_items("media", 0, 10).unwrap();
+    let items = run.store.unsaved_items("media", None, 10).unwrap();
     let failure_of = |id: &str| items.iter().find(|item| item.platform_id == id).unwrap().failure;
     assert_eq!(failure_of("lost"), FileFailure::Unavailable);
     assert_eq!(failure_of("cut"), FileFailure::Unreachable);
@@ -222,6 +222,6 @@ async fn stopping_the_run_keeps_the_list_of_what_stayed() {
     let run = run_media(adapter, control).await;
 
     assert!(run.outcome.is_err());
-    let listed: Vec<_> = run.store.unsaved_items("media", 0, 10).unwrap().into_iter().map(|item| item.platform_id).collect();
+    let listed: Vec<_> = run.store.unsaved_items("media", None, 10).unwrap().into_iter().map(|item| item.platform_id).collect();
     assert_eq!(listed, ["kept"]);
 }

@@ -15,7 +15,7 @@ pub use pending::{Consents, PendingConsents, PendingMedia};
 pub use scopes::{ScopeCount, ScopeOutcome};
 pub use search::fold_yo_ye;
 pub use state::{FileFailure, ItemState, RunState};
-pub use unsaved_files::{FileRetryRun, UnsavedFiles, UnsavedItem};
+pub use unsaved_files::{FileRetryRun, UnsavedCursor, UnsavedFiles, UnsavedItem};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

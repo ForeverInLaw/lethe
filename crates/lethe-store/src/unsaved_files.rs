@@ -21,6 +21,13 @@ pub struct UnsavedItem {
     pub failure: FileFailure,
 }
 
+/// The last row of a page of `Store::unsaved_items`; the next page starts past it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct UnsavedCursor {
+    pub created_at_secs: Option<i64>,
+    pub platform_id: String,
+}
+
 /// How much stayed in a run because of its files. `Store::unsaved_items` lists it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UnsavedFiles {
@@ -76,14 +83,28 @@ impl Store {
         )?)
     }
 
-    /// One page of what stayed in a run because of its files, newest first.
-    pub fn unsaved_items(&self, run_id: &str, offset: u32, limit: u32) -> Result<Vec<UnsavedItem>> {
+    /// One page of what stayed in a run because of its files, newest first and
+    /// undated last. It starts just past `after`, so rows a retry settles meanwhile
+    /// shift nothing.
+    pub fn unsaved_items(
+        &self,
+        run_id: &str,
+        after: Option<&UnsavedCursor>,
+        limit: u32,
+    ) -> Result<Vec<UnsavedItem>> {
+        // The order as a row value that only grows: undated after dated, newer
+        // before older, then by id.
         let mut stmt = self.conn.prepare(&format!(
             "SELECT platform_id, created_at, text, file_failure, subtype FROM items
-             WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE} ORDER BY created_at DESC, platform_id LIMIT ?2 OFFSET ?3"
+             WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE}
+               AND (?3 IS NULL OR (created_at IS NULL, -IFNULL(created_at, 0), platform_id) > (?4, -?5, ?3))
+             ORDER BY created_at IS NULL, created_at DESC, platform_id LIMIT ?2"
         ))?;
+        let undated = after.map(|cursor| cursor.created_at_secs.is_none());
+        let created_at = after.map(|cursor| cursor.created_at_secs.unwrap_or(0));
+        let platform_id = after.map(|cursor| cursor.platform_id.as_str());
         let items = stmt
-            .query_map(params![run_id, limit, offset], |r| {
+            .query_map(params![run_id, limit, platform_id, undated, created_at], |r| {
                 Ok(UnsavedItem {
                     platform_id: r.get(0)?,
                     subtype: r.get(4)?,
@@ -222,7 +243,7 @@ mod tests {
     }
 
     fn listed(store: &Store, run_id: &str) -> Vec<String> {
-        let items = store.unsaved_items(run_id, 0, 50).unwrap();
+        let items = store.unsaved_items(run_id, None, 50).unwrap();
         items.into_iter().map(|item| item.platform_id).collect()
     }
 
@@ -243,7 +264,7 @@ mod tests {
             .unwrap();
 
         let unsaved = store.unsaved_files("r1").unwrap();
-        let items = store.unsaved_items("r1", 0, 50).unwrap();
+        let items = store.unsaved_items("r1", None, 50).unwrap();
 
         assert_eq!((unsaved.total, unsaved.unavailable), (2, 1));
         assert_eq!(items.len(), 2);
@@ -254,20 +275,28 @@ mod tests {
     }
 
     #[test]
-    fn the_list_reads_page_by_page_to_its_last_row() {
+    fn a_page_starts_past_the_last_row_shown_even_once_earlier_rows_go() {
         let mut store = store();
-        run_of(&store, "r1", ACCOUNT, &["a", "b", "c"]);
-        for id in ["a", "b", "c"] {
+        run_of(&store, "r1", ACCOUNT, &["a", "b", "c", "undated"]);
+        for id in ["a", "b", "c", "undated"] {
             fail(&mut store, "r1", id, FileFailure::Unavailable);
         }
-        let page = |offset| -> Vec<String> {
-            let items = store.unsaved_items("r1", offset, 2).unwrap();
+        store.conn.execute("UPDATE items SET created_at = NULL WHERE platform_id = 'undated'", []).unwrap();
+        let page = |store: &Store, after: Option<&str>| -> Vec<String> {
+            let cursor = after.map(|id| UnsavedCursor {
+                created_at_secs: (id != "undated").then_some(100),
+                platform_id: id.into(),
+            });
+            let items = store.unsaved_items("r1", cursor.as_ref(), 2).unwrap();
             items.into_iter().map(|item| item.platform_id).collect()
         };
+        assert_eq!(page(&store, None), ["a", "b"]);
 
-        assert_eq!(page(0), ["a", "b"]);
-        assert_eq!(page(2), ["c"]);
-        assert_eq!(store.unsaved_files("r1").unwrap().total, 3);
+        store.retry_unsaved_files("r1", "r2", 20).unwrap();
+        store.record_outcomes("r2", &[("a".into(), Outcome::Deleted)]).unwrap();
+
+        assert_eq!(page(&store, Some("b")), ["c", "undated"]);
+        assert!(page(&store, Some("undated")).is_empty());
     }
 
     #[test]
