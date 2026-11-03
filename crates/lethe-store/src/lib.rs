@@ -5,6 +5,7 @@
 use lethe_adapter::{ContentType, DeleteReach, ItemRef, MediaRef, Outcome, PlatformRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 
+mod file_facts;
 mod pending;
 mod retention;
 mod scopes;
@@ -93,6 +94,10 @@ pub struct ItemRow {
     pub subtype: Option<String>,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
+    /// The name of its first named file.
+    pub file_name: Option<String>,
+    /// Bytes of its files whose size is known; `None` when none is.
+    pub file_size: Option<u64>,
     /// `Pending`, `Protected` or `Undeletable`.
     pub state: ItemState,
     pub only_for_self: bool,
@@ -288,12 +293,15 @@ impl Store {
     /// Preview rows of one group, newest first.
     pub fn preview_items(&self, run_id: &str, query: &ItemQuery) -> Result<Vec<ItemRow>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT platform_id, content_type, created_at, text, state, delete_reach, subtype
+            "SELECT platform_id, content_type, created_at, text, state, delete_reach, subtype,
+                    {}, {}
              FROM items
              WHERE run_id = ?1 AND {}
                AND (?2 IS NULL OR content_type = ?2) AND {}
              ORDER BY created_at DESC, platform_id
              LIMIT ?3 OFFSET ?4",
+            file_facts::FILE_NAME,
+            file_facts::FILE_SIZE,
             query.group.condition(),
             search::matches(5, 6)
         ))?;
@@ -313,6 +321,8 @@ impl Store {
                     subtype: r.get(6)?,
                     created_at_secs: r.get(2)?,
                     text: r.get(3)?,
+                    file_name: r.get(7)?,
+                    file_size: r.get::<_, Option<i64>>(8)?.map(|bytes| bytes as u64),
                     // Every group lists only these three states.
                     state: match r.get::<_, String>(4)?.as_str() {
                         "protected" => ItemState::Protected,
