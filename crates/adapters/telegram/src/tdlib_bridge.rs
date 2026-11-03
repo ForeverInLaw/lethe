@@ -465,7 +465,7 @@ impl<'a> Attachment<'a> {
             url: self.file.remote.unique_id.clone(),
             mime: self.mime,
             file_name: self.file_name,
-            size: Some(known_size(self.file)),
+            size: known_size(self.file),
         }
     }
 }
@@ -566,8 +566,10 @@ fn download_is_complete(file: &types::File, bytes_on_disk: u64) -> bool {
 }
 
 /// A file's `size` is 0 until TDLib learns it; `expected_size` is the estimate.
-fn known_size(file: &types::File) -> u64 {
-    file.size.max(file.expected_size).max(0) as u64
+/// With neither, the size is unknown: Telegram holds no empty files.
+fn known_size(file: &types::File) -> Option<u64> {
+    let size = file.size.max(file.expected_size);
+    (size > 0).then_some(size as u64)
 }
 
 fn map_tdlib_error(error: types::Error) -> AdapterError {
@@ -962,7 +964,7 @@ mod tests {
         assert_eq!(files[0].file.remote.unique_id, "doc");
         assert_eq!(files[0].file_name.as_deref(), Some("report.pdf"));
         assert_eq!(files[0].mime.as_deref(), Some("application/pdf"));
-        assert_eq!(known_size(files[0].file), 2048);
+        assert_eq!(known_size(files[0].file), Some(2048));
     }
 
     #[test]
@@ -1012,8 +1014,9 @@ mod tests {
 
     #[test]
     fn size_falls_back_to_the_estimate_while_unknown() {
-        assert_eq!(known_size(&file("a", 0, 500)), 500);
-        assert_eq!(known_size(&file("b", 700, 0)), 700);
+        assert_eq!(known_size(&file("a", 0, 500)), Some(500));
+        assert_eq!(known_size(&file("b", 700, 0)), Some(700));
+        assert_eq!(known_size(&file("c", 0, 0)), None);
     }
 
     #[test]
