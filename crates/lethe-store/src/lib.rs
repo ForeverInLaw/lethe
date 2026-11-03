@@ -8,10 +8,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 mod pending;
 mod retention;
 mod scopes;
+mod search;
 mod state;
 mod unsaved_files;
 pub use pending::{Consents, PendingConsents, PendingMedia};
 pub use scopes::{ScopeCount, ScopeOutcome};
+pub use search::fold_yo_ye;
 pub use state::{FileFailure, ItemState, RunState};
 pub use unsaved_files::{FileRetryRun, UnsavedFiles, UnsavedItem};
 
@@ -121,9 +123,11 @@ impl ItemGroup {
 
 /// Which preview rows to page through. Rows that already ran are never listed.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct ItemQuery {
+pub struct ItemQuery<'a> {
     pub group: ItemGroup,
     pub content_type: Option<ContentType>,
+    /// Text the rows must contain. Blank lists every row.
+    pub search: &'a str,
     pub offset: u32,
     pub limit: u32,
 }
@@ -171,6 +175,7 @@ impl Store {
         // Content the store forgets is zeroed on disk, not left in free pages.
         conn.pragma_update(None, "secure_delete", true)?;
         conn.execute_batch(include_str!("schema.sql"))?;
+        search::register(&conn)?;
         migrate_content_columns(&conn)?;
         retention::forget_what_older_versions_kept(&conn)?;
         Ok(Self { conn })
@@ -278,10 +283,11 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT platform_id, content_type, created_at, text, state, delete_reach FROM items
              WHERE run_id = ?1 AND {}
-               AND (?2 IS NULL OR content_type = ?2)
+               AND (?2 IS NULL OR content_type = ?2) AND {}
              ORDER BY created_at DESC, platform_id
              LIMIT ?3 OFFSET ?4",
-            query.group.condition()
+            query.group.condition(),
+            search::contains(5)
         ))?;
         let rows = stmt.query_map(
             params![
@@ -289,6 +295,7 @@ impl Store {
                 query.content_type.map(content_type_str),
                 i64::from(query.limit),
                 i64::from(query.offset),
+                search::needle(query.search),
             ],
             |r| {
                 Ok(ItemRow {
