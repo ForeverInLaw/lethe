@@ -13,6 +13,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 
 use lethe_crypto::DataKey;
@@ -43,7 +44,7 @@ pub struct ExportReport {
 
 /// An archive that opened with the right key, ready to be written out.
 pub struct ArchiveExport<R: Read> {
-    walk: ArchiveWalk<R>,
+    walk: ArchiveWalk<Tally<R>>,
     manifest: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -51,19 +52,27 @@ impl<R: Read> ArchiveExport<R> {
     /// Checks the key by reading the manifest, so a wrong one fails before the
     /// person is asked where to export and before anything is written.
     pub fn open(source: R, key: &DataKey) -> Result<Self> {
-        let (walk, manifest) = ArchiveWalk::open(source, key)?;
+        let (walk, manifest) = ArchiveWalk::open(Tally { source, read: 0 }, key)?;
         let manifest =
             serde_json::from_slice(&manifest).map_err(|_| corrupt("unreadable manifest"))?;
         Ok(Self { walk, manifest })
     }
 
     /// Exports into a new folder under `parent`, numbering the name if it is taken.
-    /// Removes the folder again if it cannot be written in full.
-    pub fn write_to(self, parent: &Path, folder_name: &str) -> Result<ExportReport> {
+    /// `watch` hears how many bytes of the archive have been read, after every
+    /// record and every chunk of a file, and can stop the export there. Removes the
+    /// folder again if it is stopped, failing with `Aborted`, or cannot be written
+    /// in full.
+    pub fn write_to(
+        self,
+        parent: &Path,
+        folder_name: &str,
+        watch: impl FnMut(u64) -> ControlFlow<()>,
+    ) -> Result<ExportReport> {
         let (_, name) =
             claim_name(folder_name, |name| fs::create_dir(parent.join(name))).map_err(io_error)?;
         let folder = parent.join(name);
-        self.fill(&folder)
+        self.fill(&folder, watch)
             .map_err(|error| match fs::remove_dir_all(&folder) {
                 Ok(()) => error,
                 Err(cleanup) => EngineError::Io(format!(
@@ -73,7 +82,11 @@ impl<R: Read> ArchiveExport<R> {
             })
     }
 
-    fn fill(mut self, folder: &Path) -> Result<ExportReport> {
+    fn fill(
+        mut self,
+        folder: &Path,
+        mut watch: impl FnMut(u64) -> ControlFlow<()>,
+    ) -> Result<ExportReport> {
         let mut output = ExportFolder::create(folder).map_err(io_error)?;
         let mut report = ExportReport {
             folder: folder.to_owned(),
@@ -84,18 +97,35 @@ impl<R: Read> ArchiveExport<R> {
         };
         // A read that fails is where the archive ends for this export.
         while let Ok(next) = self.walk.next_record() {
+            if watch(self.walk.source().read).is_break() {
+                return Err(EngineError::Aborted);
+            }
             let Some((record, raw)) = next else {
                 report.complete = true;
                 break;
             };
             report.items += 1;
-            output.add_item(&mut self.walk, &record, &raw, &mut report)?;
+            output.add_item(&mut self.walk, &record, &raw, &mut report, &mut watch)?;
             if report.partial_file.is_some() {
                 break;
             }
         }
         output.finish(&report, self.manifest)?;
         Ok(report)
+    }
+}
+
+/// Counts the bytes read through it, to tell how far an export has come.
+struct Tally<R> {
+    source: R,
+    read: u64,
+}
+
+impl<R: Read> Read for Tally<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.source.read(buf)?;
+        self.read += n as u64;
+        Ok(n)
     }
 }
 
@@ -128,10 +158,11 @@ impl ExportFolder {
     /// Writes one item and its files, up to the file the archive breaks in, if any.
     fn add_item<R: Read>(
         &mut self,
-        walk: &mut ArchiveWalk<R>,
+        walk: &mut ArchiveWalk<Tally<R>>,
         record: &ReadRecord,
         raw: &[u8],
         report: &mut ExportReport,
+        watch: &mut impl FnMut(u64) -> ControlFlow<()>,
     ) -> Result<()> {
         self.records.write_all(raw).map_err(io_error)?;
         self.records.write_all(b"\n").map_err(io_error)?;
@@ -144,7 +175,7 @@ impl ExportFolder {
             .filter_map(|(index, media)| Some((index, media, media.stored.as_ref()?)));
         for (index, media, stored) in stored_files {
             let wanted = export_file_name(record, media, index);
-            match self.add_file(walk, stored, &wanted)? {
+            match self.add_file(walk, stored, &wanted, watch)? {
                 SavedFile::Whole(name) => {
                     report.media_files += 1;
                     names.push(name);
@@ -163,19 +194,20 @@ impl ExportFolder {
     /// it got, under a `.part` name so nobody takes it for the whole file.
     fn add_file<R: Read>(
         &self,
-        walk: &mut ArchiveWalk<R>,
+        walk: &mut ArchiveWalk<Tally<R>>,
         stored: &StoredFile,
         wanted: &str,
+        watch: &mut impl FnMut(u64) -> ControlFlow<()>,
     ) -> Result<SavedFile> {
         let (file, name) =
             claim_name(wanted, |name| File::create_new(self.files.join(name))).map_err(io_error)?;
         let mut out = BufWriter::new(file);
-        let copied = walk.copy_file(stored, &mut out);
+        let copied = walk.copy_file(stored, &mut out, |tally| watch(tally.read));
         out.flush().map_err(io_error)?;
         drop(out);
         match copied {
             Ok(()) => Ok(SavedFile::Whole(name)),
-            Err(failure @ CopyFailure::Output(_)) => Err(failure.into()),
+            Err(failure @ (CopyFailure::Output(_) | CopyFailure::Stopped)) => Err(failure.into()),
             Err(CopyFailure::Archive(_)) => {
                 let (_, partial) = claim_name(&format!("{name}.part"), |partial| {
                     File::create_new(self.files.join(partial))
@@ -354,7 +386,7 @@ mod tests {
     fn export(scratch: &Scratch, buf: &[u8]) -> ExportReport {
         ArchiveExport::open(buf, &KEY)
             .unwrap()
-            .write_to(&scratch.0, "export")
+            .write_to(&scratch.0, "export", |_| ControlFlow::Continue(()))
             .unwrap()
     }
 
@@ -409,6 +441,52 @@ mod tests {
             serde_json::from_str(&read(&report, "manifest.json")).unwrap();
         assert_eq!(manifest["platform"], "telegram");
         assert_eq!(manifest["complete"], true);
+    }
+
+    #[test]
+    fn export_tells_how_much_of_the_archive_it_has_read() {
+        let scratch = Scratch::new();
+        let record = record_with_files("1", &["a.jpg"], 3);
+        let buf = archive(&[MANIFEST, &record, b"abc"]);
+        let mut read = Vec::new();
+
+        ArchiveExport::open(buf.as_slice(), &KEY)
+            .unwrap()
+            .write_to(&scratch.0, "export", |bytes| {
+                read.push(bytes);
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+
+        assert!(read.is_sorted(), "{read:?}");
+        assert_eq!(read.last(), Some(&(buf.len() as u64)));
+    }
+
+    #[test]
+    fn stopping_inside_a_file_removes_the_export() {
+        let scratch = Scratch::new();
+        let record = br#"{"platform_id":"1","media":[{"url":"u","file_name":"clip.mp4","archived_bytes":6,"chunks":2}]}"#;
+        let buf = archive(&[MANIFEST, record, b"abc", b"def"]);
+        // Each frame is a 4-byte length, the chunk and 17 bytes of authentication;
+        // after the first chunk come the second one and the sealing frame.
+        let frame = |chunk: u64| 4 + chunk + 17;
+        let first_chunk_read = buf.len() as u64 - frame(3) - frame(0);
+        let mut seen = Vec::new();
+
+        let result = ArchiveExport::open(buf.as_slice(), &KEY)
+            .unwrap()
+            .write_to(&scratch.0, "export", |bytes| {
+                seen.push(bytes);
+                if bytes == first_chunk_read {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+
+        assert!(matches!(result, Err(EngineError::Aborted)), "{result:?}");
+        assert_eq!(seen.last(), Some(&first_chunk_read), "{seen:?}");
+        assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
     }
 
     #[test]
