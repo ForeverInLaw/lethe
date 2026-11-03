@@ -125,13 +125,13 @@ pub async fn snapshot(
     let mut stream = adapter
         .enumerate(&req.plan)
         .await
-        .map_err(|e| EngineError::Adapter(e.to_string()))?;
+        .map_err(EngineError::Adapter)?;
 
     let mut buf: Vec<ItemSnapshot> = Vec::with_capacity(SNAPSHOT_FLUSH);
     let mut seen: u64 = 0;
 
     while let Some(item) = stream.next().await {
-        let item: Item = item.map_err(|e| EngineError::Adapter(e.to_string()))?;
+        let item: Item = item.map_err(EngineError::Adapter)?;
         seen += 1;
 
         let pid = &item.item_ref.platform_id;
@@ -642,6 +642,50 @@ mod tests {
         fn rate_policy(&self) -> RatePolicy {
             self.inner.rate_policy()
         }
+    }
+
+    /// Adapter whose listing ends in an expired session.
+    struct ExpiredSessionAdapter(FakeAdapter);
+
+    #[async_trait]
+    impl PlatformAdapter for ExpiredSessionAdapter {
+        fn descriptor(&self) -> &Descriptor {
+            self.0.descriptor()
+        }
+
+        async fn enumerate(&self, _plan: &EnumeratePlan) -> std::result::Result<ItemStream, AdapterError> {
+            Ok(Box::pin(stream::iter([Err(AdapterError::Auth("ExpiredToken".into()))])))
+        }
+
+        async fn delete(&self, items: &[ItemRef]) -> Vec<Outcome> {
+            self.0.delete(items).await
+        }
+
+        fn rate_policy(&self) -> RatePolicy {
+            self.0.rate_policy()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scan_the_platform_stops_says_why() {
+        let adapter: Arc<dyn PlatformAdapter> = Arc::new(ExpiredSessionAdapter(FakeAdapter::with_items(0)));
+        let store = Store::open_in_memory("test-key").unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let req = RunRequest {
+            run_id: "expired".into(),
+            platform: "fake".into(),
+            account_id: "fake:a".into(),
+            account_label: "acc".into(),
+            plan: EnumeratePlan::default(),
+            filter: match_all_filter(),
+            allow_incomplete_backup: false,
+            allow_lost_files: false,
+            allow_only_for_self: false,
+        };
+
+        let error = snapshot(adapter, &store, &req, &tx).await.unwrap_err();
+
+        assert!(matches!(error, EngineError::Adapter(AdapterError::Auth(_))), "{error}");
     }
 
     pub(super) fn match_all_filter() -> FilterSpec {

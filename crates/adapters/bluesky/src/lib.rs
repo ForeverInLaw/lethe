@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use atrium_api::agent::Configure;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::agent::atp_agent::{AtpAgent, AtpSession};
 use atrium_api::types::string::{AtIdentifier, Cid, Did, Nsid, RecordKey};
@@ -82,6 +83,16 @@ fn map_err<E: std::fmt::Display + std::fmt::Debug>(e: atrium_api::xrpc::Error<E>
         }
     }
     AdapterError::Transport(e.to_string())
+}
+
+/// A sign-in or a session resume the server refuses means the credentials no longer
+/// work; no answer, a server fault or a rate limit says nothing about them.
+fn sign_in_error<E: std::fmt::Display + std::fmt::Debug>(e: atrium_api::xrpc::Error<E>) -> AdapterError {
+    match map_err(e) {
+        AdapterError::Platform(message) => AdapterError::Auth(message),
+        AdapterError::NotFound => AdapterError::Auth("the server has no such account".into()),
+        other => other,
+    }
 }
 
 /// The file is gone, but the post may not be: core must not count it as deleted. Only
@@ -159,7 +170,7 @@ impl BlueskyAdapter {
         self.agent
             .resume_session(session)
             .await
-            .map_err(|e| AdapterError::Auth(e.to_string()))?;
+            .map_err(sign_in_error)?;
         self.did = Some(did);
         Ok(())
     }
@@ -439,11 +450,12 @@ fn blob_media(blob: BlobRef) -> MediaRef {
 /// App-password auth (tracer). Debt: replace with DPoP OAuth before ship.
 pub struct BlueskyAuth {
     egress: Arc<Egress>,
+    entryway: String,
 }
 
 impl BlueskyAuth {
     pub fn new(egress: Arc<Egress>) -> Self {
-        Self { egress }
+        Self { egress, entryway: ENTRYWAY.into() }
     }
 }
 
@@ -464,10 +476,8 @@ impl AuthProvider for BlueskyAuth {
             .ok_or_else(|| AdapterError::Auth("no app password provided".into()))?;
 
         let agent = build_agent(&self.egress);
-        agent
-            .login(&identifier, &password)
-            .await
-            .map_err(|e| AdapterError::Auth(e.to_string()))?;
+        agent.configure_endpoint(self.entryway.clone());
+        agent.login(&identifier, &password).await.map_err(sign_in_error)?;
         let session = agent
             .get_session()
             .await
@@ -487,7 +497,7 @@ impl AuthProvider for BlueskyAuth {
         agent
             .resume_session(session)
             .await
-            .map_err(|e| AdapterError::Auth(e.to_string()))?;
+            .map_err(sign_in_error)?;
         let session = agent
             .get_session()
             .await
@@ -512,7 +522,6 @@ impl AuthProvider for BlueskyAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use atrium_api::agent::Configure;
     use serde_json::json;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -870,5 +879,57 @@ mod tests {
         let out = a.delete(&items).await;
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0], Outcome::Failed { retryable: false, .. }));
+    }
+
+    /// Answers the sign-in form with a handle and an app password.
+    struct Form;
+
+    #[async_trait]
+    impl Consent for Form {
+        async fn confirm(&self, _prompt: &str) -> bool {
+            true
+        }
+        async fn input(&self, _prompt: &str, secret: bool) -> Option<String> {
+            Some(if secret { "app-password" } else { "alice.test" }.into())
+        }
+    }
+
+    async fn sign_in_at(entryway: String) -> AdapterError {
+        let auth = BlueskyAuth { egress: Arc::new(Egress::new(std::iter::empty::<String>())), entryway };
+        auth.connect(&Form).await.unwrap_err()
+    }
+
+    async fn sign_in_answered_with(reply: ResponseTemplate) -> AdapterError {
+        let entryway = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/xrpc/com.atproto.server.createSession"))
+            .respond_with(reply)
+            .mount(&entryway)
+            .await;
+        sign_in_at(entryway.uri()).await
+    }
+
+    #[tokio::test]
+    async fn a_wrong_app_password_is_a_refused_sign_in() {
+        let reply = ResponseTemplate::new(401)
+            .set_body_json(json!({ "error": "AuthenticationRequired", "message": "Invalid identifier or password" }));
+
+        let error = sign_in_answered_with(reply).await;
+
+        assert!(matches!(error, AdapterError::Auth(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_without_network_is_not_a_wrong_password() {
+        let error = sign_in_at("http://127.0.0.1:1".into()).await;
+
+        assert!(matches!(error, AdapterError::Transport(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn too_many_sign_ins_ask_to_wait() {
+        let error = sign_in_answered_with(ResponseTemplate::new(429)).await;
+
+        assert!(matches!(error, AdapterError::RateLimited { .. }), "{error}");
     }
 }
