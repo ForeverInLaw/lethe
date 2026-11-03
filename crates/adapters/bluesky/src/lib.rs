@@ -277,7 +277,8 @@ impl PlatformAdapter for BlueskyAdapter {
         Ok(FetchedMedia { path, handle: 0 })
     }
 
-    /// Any answer from the PDS, a refusal included, means it is there.
+    /// Any answer from the PDS, a refusal included, means it is there. A server fault
+    /// counts as down, like a network error: the run waits rather than failing files.
     async fn is_reachable(&self) -> bool {
         let answer = self.agent.api.com.atproto.server.describe_server().await;
         !matches!(answer.map_err(map_err), Err(AdapterError::Transport(_)))
