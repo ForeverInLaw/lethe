@@ -91,8 +91,8 @@ impl RunOutcome {
     }
 }
 
-/// Sign the run summary and persist the receipt. Shared by the CLI and the
-/// Tauri shell so receipt handling lives in exactly one place.
+/// Sign the run summary and persist the receipt, so receipt handling lives in the
+/// engine rather than in each shell.
 pub fn store_receipt(
     store: &Store,
     signer: &ReceiptSigner,
@@ -193,7 +193,7 @@ pub async fn execute(
     progress: &ProgressTx,
     backup: Option<BackupTarget>,
 ) -> Result<RunOutcome> {
-    // Open the encrypted backup up front (FR-BAK-1, on-by-default): given a target,
+    // Open the encrypted backup up front (FR-BAK-1): given a target,
     // every item is archived BEFORE its delete, so an interrupted run never deletes
     // anything it has not backed up. Without one, the run keeps no copy.
     let mut writer = backup.as_ref().map(|target| ArchiveWriter::create(target, req)).transpose()?;
