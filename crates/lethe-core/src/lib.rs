@@ -64,11 +64,12 @@ impl RunControl {
     pub fn new() -> Self {
         Self::default()
     }
+    /// Pause and resume never undo a stop: anything still waiting on it must see it.
     pub fn pause(&self) {
-        self.0.store(PAUSE, Ordering::SeqCst);
+        let _ = self.0.compare_exchange(RUN, PAUSE, Ordering::SeqCst, Ordering::SeqCst);
     }
     pub fn resume(&self) {
-        self.0.store(RUN, Ordering::SeqCst);
+        let _ = self.0.compare_exchange(PAUSE, RUN, Ordering::SeqCst, Ordering::SeqCst);
     }
     pub fn stop(&self) {
         self.0.store(STOP, Ordering::SeqCst);
@@ -93,6 +94,16 @@ mod tests {
     use std::time::Duration;
 
     use super::RunControl;
+
+    #[test]
+    fn a_stop_holds_through_a_later_pause_or_resume() {
+        let control = RunControl::new();
+        control.stop();
+        control.resume();
+        control.pause();
+
+        assert!(control.is_stopped());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn stopped_completes_once_the_run_is_stopped_and_not_on_a_pause() {
