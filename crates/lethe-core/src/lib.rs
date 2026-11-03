@@ -16,8 +16,9 @@ pub enum EngineError {
     Filter(#[from] filter::FilterError),
     #[error(transparent)]
     Store(#[from] lethe_store::StoreError),
+    /// The platform stopped the work; the app tells the person why from its kind.
     #[error("adapter: {0}")]
-    Adapter(String),
+    Adapter(lethe_adapter::AdapterError),
     #[error(transparent)]
     Crypto(#[from] lethe_crypto::CryptoError),
     #[error("backup io: {0}")]
@@ -43,7 +44,6 @@ pub enum ProgressEvent {
     /// The platform answers again after `Offline`; the run goes on.
     Online,
     Done { run_id: String },
-    Error { message: String },
 }
 
 pub type ProgressTx = tokio::sync::mpsc::UnboundedSender<ProgressEvent>;
