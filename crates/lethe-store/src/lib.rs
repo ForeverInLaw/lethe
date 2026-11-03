@@ -5,6 +5,7 @@
 use lethe_adapter::{ContentType, DeleteReach, ItemRef, MediaRef, Outcome, PlatformRecord};
 use rusqlite::{params, Connection, OptionalExtension};
 
+mod choice;
 mod file_facts;
 mod filter;
 mod pending;
@@ -15,6 +16,7 @@ mod state;
 mod unsaved_files;
 pub use pending::{Consents, PendingConsents, PendingMedia};
 pub use scopes::{ScopeCount, ScopeOutcome};
+pub use choice::ChoiceCounts;
 pub use filter::{ItemFilter, ItemGroup};
 pub use search::fold_yo_ye;
 pub use state::{FileFailure, ItemState, RunState};
