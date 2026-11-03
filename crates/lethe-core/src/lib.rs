@@ -53,6 +53,9 @@ pub type ProgressTx = tokio::sync::mpsc::UnboundedSender<ProgressEvent>;
 #[derive(Clone, Default)]
 pub struct RunControl(Arc<AtomicU8>);
 
+/// How soon a stop is noticed by work that waits.
+pub(crate) const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
 const RUN: u8 = 0;
 const PAUSE: u8 = 1;
 const STOP: u8 = 2;
@@ -75,5 +78,35 @@ impl RunControl {
     }
     pub fn is_paused(&self) -> bool {
         self.0.load(Ordering::SeqCst) == PAUSE
+    }
+    /// Completes once the run has been stopped, for work that must be called off
+    /// mid-way, such as a download.
+    pub async fn stopped(&self) {
+        while !self.is_stopped() {
+            tokio::time::sleep(STOP_POLL).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::RunControl;
+
+    #[tokio::test(start_paused = true)]
+    async fn stopped_completes_once_the_run_is_stopped_and_not_on_a_pause() {
+        let control = RunControl::new();
+        let waiting = tokio::spawn({
+            let control = control.clone();
+            async move { control.stopped().await }
+        });
+
+        control.pause();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(!waiting.is_finished());
+
+        control.stop();
+        tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap();
     }
 }
