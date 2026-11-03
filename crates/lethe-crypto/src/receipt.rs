@@ -111,16 +111,66 @@ impl ReceiptSigner {
 
 /// Offline verification. `Err(BadSignature)` if tampered or malformed.
 pub fn verify(receipt: &SignedReceipt) -> Result<()> {
-    let pk_bytes = from_hex(&receipt.public_key_hex).ok_or(CryptoError::BadSignature)?;
-    let sig_bytes = from_hex(&receipt.signature_hex).ok_or(CryptoError::BadSignature)?;
+    let bytes = canonical(&receipt.summary)?;
+    verify_detached(&bytes, &receipt.public_key_hex, &receipt.signature_hex)
+}
+
+fn verify_detached(message: &[u8], public_key_hex: &str, signature_hex: &str) -> Result<()> {
+    let pk_bytes = from_hex(public_key_hex).ok_or(CryptoError::BadSignature)?;
+    let sig_bytes = from_hex(signature_hex).ok_or(CryptoError::BadSignature)?;
     let public_key: [u8; PUBLIC_KEY_LEN] =
         pk_bytes.try_into().map_err(|_| CryptoError::BadSignature)?;
     let signature: [u8; SIGNATURE_LEN] =
         sig_bytes.try_into().map_err(|_| CryptoError::BadSignature)?;
 
-    let bytes = canonical(&receipt.summary)?;
-    crypto_sign_verify_detached(&signature, &bytes, &public_key)
+    crypto_sign_verify_detached(&signature, message, &public_key)
         .map_err(|_| CryptoError::BadSignature)
+}
+
+/// Names the layout of a `ReceiptFile`, so a later layout can be told apart.
+const RECEIPT_FILE_FORMAT: &str = "lethe-receipt/1";
+const RECEIPT_FILE_ALGORITHM: &str = "ed25519";
+/// Where someone handed a receipt file finds how to check it.
+const RECEIPT_FILE_ABOUT: &str = "https://github.com/ForeverInLaw/lethe/blob/master/docs/receipt-file.md";
+
+/// A receipt as a JSON file a person can hand over, checked without the app or its
+/// store: an Ed25519 signature by `public_key_hex` over the UTF-8 bytes of
+/// `summary`. `docs/receipt-file.md` shows how.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptFile {
+    format: String,
+    /// A link to the layout and to how to check it; the check does not read it.
+    about: String,
+    algorithm: String,
+    /// The summary exactly as it was signed. It stays text, because encoding it
+    /// again could change the bytes the signature covers.
+    summary: String,
+    public_key_hex: String,
+    signature_hex: String,
+}
+
+impl ReceiptFile {
+    /// `summary_json` must be the signed text as stored, not a summary encoded again.
+    pub fn new(summary_json: String, public_key_hex: String, signature_hex: String) -> Self {
+        Self {
+            format: RECEIPT_FILE_FORMAT.into(),
+            about: RECEIPT_FILE_ABOUT.into(),
+            algorithm: RECEIPT_FILE_ALGORITHM.into(),
+            summary: summary_json,
+            public_key_hex,
+            signature_hex,
+        }
+    }
+
+    /// The summary, once its signature holds. `Err(BadSignature)` for an edited
+    /// file or one in a layout this version does not know.
+    pub fn verify(&self) -> Result<RunSummary> {
+        if self.format != RECEIPT_FILE_FORMAT || self.algorithm != RECEIPT_FILE_ALGORITHM {
+            return Err(CryptoError::BadSignature);
+        }
+        verify_detached(self.summary.as_bytes(), &self.public_key_hex, &self.signature_hex)?;
+        serde_json::from_str(&self.summary).map_err(|_| CryptoError::BadSignature)
+    }
 }
 
 #[cfg(test)]
@@ -184,6 +234,39 @@ mod tests {
         receipt.summary.deleted_only_for_self = 0;
 
         assert!(matches!(verify(&receipt), Err(CryptoError::BadSignature)));
+    }
+
+    #[test]
+    fn a_receipt_file_proves_its_summary_without_the_store() {
+        let signer = ReceiptSigner::generate();
+        let receipt = signer.sign(&summary()).unwrap();
+        let signed_text = serde_json::to_string(&receipt.summary).unwrap();
+        let file = ReceiptFile::new(signed_text, receipt.public_key_hex, receipt.signature_hex);
+        let handed_over = serde_json::to_string_pretty(&file).unwrap();
+
+        let proven = serde_json::from_str::<ReceiptFile>(&handed_over).unwrap().verify().unwrap();
+
+        assert_eq!((proven.run_id.as_str(), proven.deleted), ("run-1", 37));
+    }
+
+    #[test]
+    fn a_receipt_file_with_an_edited_summary_or_another_key_fails() {
+        let signer = ReceiptSigner::generate();
+        let receipt = signer.sign(&summary()).unwrap();
+        let signed_text = serde_json::to_string(&receipt.summary).unwrap();
+        let edited = ReceiptFile::new(
+            signed_text.replace("\"deleted\":37", "\"deleted\":38"),
+            receipt.public_key_hex.clone(),
+            receipt.signature_hex.clone(),
+        );
+        let other_key = ReceiptFile::new(
+            signed_text,
+            ReceiptSigner::generate().public_key_hex(),
+            receipt.signature_hex,
+        );
+
+        assert!(matches!(edited.verify(), Err(CryptoError::BadSignature)));
+        assert!(matches!(other_key.verify(), Err(CryptoError::BadSignature)));
     }
 
     #[test]
