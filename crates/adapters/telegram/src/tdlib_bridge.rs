@@ -221,15 +221,16 @@ fn message_ref(message: &types::Message, delete_reach: DeleteReach) -> Result<Te
 }
 
 /// Downloads one of a message's files to TDLib's files directory. Re-reads the
-/// message so the file id and its server reference are current. TDLib waits out a
-/// lost connection without returning, so the download is called off once
-/// `connection_lost` completes and fails as a network error.
+/// message so the file id and its server reference are current. TDLib keeps a
+/// download going on its own, through a stop or a lost connection, so it is called
+/// off in TDLib once `call_off` completes, with the reason it gives, and fails as a
+/// network error. Its partial copy is removed either way.
 pub async fn download_message_file(
     client_id: TdlibClientId,
     chat_id: i64,
     message_id: i64,
     unique_id: &str,
-    connection_lost: impl Future<Output = ()>,
+    call_off: impl Future<Output = &'static str>,
 ) -> Result<FetchedMedia, AdapterError> {
     let enums::Message::Message(message) =
         functions::get_message(chat_id, message_id, client_id.raw())
@@ -242,14 +243,13 @@ pub async fn download_message_file(
         .ok_or_else(|| AdapterError::FileRefused("the message no longer has this file".into()))?;
 
     let download = functions::download_file(file.id, DOWNLOAD_PRIORITY, 0, 0, true, client_id.raw());
-    let downloaded = match future::select(pin!(download), pin!(connection_lost)).await {
+    let downloaded = match future::select(pin!(download), pin!(call_off)).await {
         Either::Left((downloaded, _)) => downloaded.map_err(map_download_error),
-        Either::Right(((), _)) => {
+        Either::Right((reason, _)) => {
             let cancelled = functions::cancel_download_file(file.id, false, client_id.raw()).await;
-            let lost = "the connection to Telegram was lost";
             Err(AdapterError::Transport(match cancelled {
-                Ok(_) => lost.into(),
-                Err(error) => format!("{lost}, and the download kept going: {}", error.message),
+                Ok(_) => reason.into(),
+                Err(error) => format!("{reason}, and the download kept going: {}", error.message),
             }))
         }
     };
