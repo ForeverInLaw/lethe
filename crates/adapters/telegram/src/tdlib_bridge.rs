@@ -241,13 +241,12 @@ pub async fn download_message_file(
     let downloaded = match future::select(pin!(download), pin!(connection_lost)).await {
         Either::Left((downloaded, _)) => downloaded.map_err(map_download_error),
         Either::Right(((), _)) => {
+            let cancelled = functions::cancel_download_file(file.id, false, client_id.raw()).await;
             let lost = "the connection to Telegram was lost";
-            Err(AdapterError::Transport(
-                match functions::cancel_download_file(file.id, false, client_id.raw()).await {
-                    Ok(_) => lost.into(),
-                    Err(error) => format!("{lost}, and the download kept going: {}", error.message),
-                },
-            ))
+            Err(AdapterError::Transport(match cancelled {
+                Ok(_) => lost.into(),
+                Err(error) => format!("{lost}, and the download kept going: {}", error.message),
+            }))
         }
     };
     let fetched = downloaded
