@@ -68,6 +68,14 @@ the platform returned, so alt text, links and quotes stay too. A post whose file
 be fetched stays where it is, and one with a broken file reference is deleted only if
 the person agrees to that. This has passed a live cleanup of posts with files.
 
+A run seals its backup however it ends, stopped or failed, so the backup of what it
+already deleted still verifies. The one exception is a write that fails halfway through
+an item, on a full disk for one: the backup is then cut back to the last whole item and
+left unsealed, because sealing after the lost bytes would reuse their nonce.
+`audit_archive` reports such a backup as cut off, with what it holds up to the cut, and
+fails only on one that is damaged. `BlueskyAdapter::download_to` puts downloaded files,
+which are plaintext until archived, in a folder the caller can empty on startup.
+
 `lethe_core::archive::ArchiveExport` turns a backup back into a plain folder: readable
 text, every record in full, and the files under their original names. A damaged or
 unsealed backup exports up to the point it breaks. The folder is not encrypted. The

@@ -191,9 +191,6 @@ pub async fn execute(
     progress: &ProgressTx,
     backup: Option<BackupTarget>,
 ) -> Result<RunOutcome> {
-    let policy = adapter.rate_policy();
-    let mut outcome = RunOutcome::default();
-
     // Open the encrypted backup up front (FR-BAK-1, on-by-default): if a target
     // is given and the run requests backup, every item is archived BEFORE its
     // delete, so an interrupted run never deletes anything it has not backed up.
@@ -201,6 +198,37 @@ pub async fn execute(
         (Some(target), true) => Some(ArchiveWriter::create(target, req)?),
         _ => None,
     };
+    let result = delete_backed_up(adapter, store, scheduler, req, &control, progress, writer.as_mut()).await;
+
+    // Sealed however the run ended (emits the FINAL frame; truncation is now
+    // detectable), so a run that stops or fails keeps a complete backup of
+    // everything it already deleted. The one exception is an item cut off halfway
+    // through writing it, after which the backup ends unsealed but whole.
+    let sealed = writer.map_or(Ok(()), ArchiveWriter::finish);
+    if let (Err(_), Err(error)) = (&result, &sealed) {
+        tracing::warn!(%error, "could not seal the backup of a run that failed");
+    }
+    let outcome = result?;
+    sealed?;
+
+    // Receipt signing is the caller's job (it owns the clock + identity): it
+    // dates this `RunOutcome` with `RunOutcome::summary` and calls `store_receipt`.
+    let _ = progress.send(ProgressEvent::Done { run_id: req.run_id.clone() });
+    Ok(outcome)
+}
+
+/// The loop of Phase 2. Leaves the backup open for `execute` to seal.
+async fn delete_backed_up(
+    adapter: Arc<dyn PlatformAdapter>,
+    store: &mut Store,
+    scheduler: &mut Scheduler,
+    req: &RunRequest,
+    control: &RunControl,
+    progress: &ProgressTx,
+    mut writer: Option<&mut ArchiveWriter>,
+) -> Result<RunOutcome> {
+    let policy = adapter.rate_policy();
+    let mut outcome = RunOutcome::default();
     if !req.allow_incomplete_backup {
         store.protect_backup_gaps(&req.run_id)?;
     }
@@ -228,8 +256,8 @@ pub async fn execute(
     let mut archived: HashSet<String> = HashSet::new();
 
     loop {
-        if !keep_running(&control).await {
-            return abort(writer);
+        if !keep_running(control).await {
+            return Err(EngineError::Aborted);
         }
 
         let batch = store.claim_pending_items(&req.run_id, DELETE_BATCH)?;
@@ -243,13 +271,13 @@ pub async fn execute(
 
         for item in &batch {
             let platform_id = &item.item_ref.platform_id;
-            let Some(w) = writer.as_mut().filter(|_| !archived.contains(platform_id)) else {
+            let Some(w) = writer.as_deref_mut().filter(|_| !archived.contains(platform_id)) else {
                 deletable.push(item);
                 continue;
             };
 
-            match archive_item(adapter.as_ref(), w, item, req.allow_lost_files, &control).await? {
-                ArchiveResult::Stopped => return abort(writer),
+            match archive_item(adapter.as_ref(), w, item, req.allow_lost_files, control).await? {
+                ArchiveResult::Stopped => return Err(EngineError::Aborted),
                 ArchiveResult::Archived => {
                     archived.insert(platform_id.clone());
                     deletable.push(item);
@@ -291,10 +319,10 @@ pub async fn execute(
 
         if !deletable.is_empty() {
             // Downloads can take long enough for a stop to arrive after the last gate.
-            if !keep_running(&control).await {
-                return abort(writer);
+            if !keep_running(control).await {
+                return Err(EngineError::Aborted);
             }
-            if let Some(w) = writer.as_ref() {
+            if let Some(w) = writer.as_deref() {
                 w.sync()?;
             }
 
@@ -342,15 +370,6 @@ pub async fn execute(
             bucket.penalize(Duration::from_secs(wait_secs)).await;
         }
     }
-
-    // Seal the archive (emits the FINAL frame; truncation is now detectable).
-    if let Some(w) = writer.take() {
-        w.finish()?;
-    }
-
-    // Receipt signing is the caller's job (it owns the clock + identity): it
-    // dates this `RunOutcome` with `RunOutcome::summary` and calls `store_receipt`.
-    let _ = progress.send(ProgressEvent::Done { run_id: req.run_id.clone() });
     Ok(outcome)
 }
 
@@ -360,15 +379,6 @@ async fn keep_running(control: &RunControl) -> bool {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     !control.is_stopped()
-}
-
-/// Seals what was archived so far: a stopped run keeps a complete backup of
-/// everything it already deleted.
-fn abort(writer: Option<ArchiveWriter>) -> Result<RunOutcome> {
-    if let Some(writer) = writer {
-        writer.finish()?;
-    }
-    Err(EngineError::Aborted)
 }
 
 enum ArchiveResult {
@@ -465,6 +475,8 @@ async fn archive_item(
 mod delete_reach_tests;
 #[cfg(test)]
 mod file_failure_tests;
+#[cfg(test)]
+mod sealing_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1171,7 +1183,7 @@ mod tests {
         let run = run_media(adapter, RunControl::new()).await;
 
         assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
-        assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1 });
+        assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1, complete: true });
     }
 
     #[tokio::test]
@@ -1185,7 +1197,7 @@ mod tests {
         let run = run_media(adapter.clone(), RunControl::new()).await;
 
         assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
-        assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1 });
+        assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1, complete: true });
         assert_eq!(adapter.fetches.load(Ordering::SeqCst), 1);
     }
 
@@ -1204,7 +1216,7 @@ mod tests {
         let run = run_media(adapter.clone(), control).await;
 
         assert!(matches!(run.outcome, Err(EngineError::Aborted)));
-        assert_eq!(run.audit().items, 1);
+        assert_eq!(run.audit(), crate::archive::ArchiveAudit { items: 1, media_files: 1, complete: true });
         assert!(adapter.journal().iter().all(|entry| !entry.starts_with("delete")));
         assert_eq!(run.store.preview_counts("media").unwrap().pending, 2);
     }
