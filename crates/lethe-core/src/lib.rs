@@ -38,6 +38,10 @@ pub enum ProgressEvent {
     Archiving { done_bytes: u64, total_bytes: u64 },
     Deleting { deleted: u64, skipped: u64, failed: u64, total: u64 },
     Throttled { rate_per_sec: f64, wait_secs: u64 },
+    /// The platform stopped answering; the run waits for it without failing items.
+    Offline,
+    /// The platform answers again after `Offline`; the run goes on.
+    Online,
     Done { run_id: String },
     Error { message: String },
 }

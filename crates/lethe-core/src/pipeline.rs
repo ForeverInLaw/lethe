@@ -24,6 +24,8 @@ const DELETE_BATCH: usize = 100;
 const FETCH_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_secs(2), Duration::from_secs(8), Duration::from_secs(30)];
 const STOP_POLL: Duration = Duration::from_millis(200);
+/// How often a run held by an outage asks whether the platform answers again.
+const CONNECTION_POLL: Duration = Duration::from_secs(10);
 
 pub struct RunRequest {
     pub run_id: String,
@@ -275,7 +277,7 @@ async fn delete_backed_up(
                 continue;
             };
 
-            match archive_item(adapter.as_ref(), w, item, req.allow_lost_files, control).await? {
+            match archive_item(adapter.as_ref(), w, item, req.allow_lost_files, control, progress).await? {
                 ArchiveResult::Stopped => return Err(EngineError::Aborted),
                 ArchiveResult::Archived => {
                     archived.insert(platform_id.clone());
@@ -388,12 +390,14 @@ enum ArchiveResult {
 }
 
 /// Downloads one file, waiting out a network problem so that a blip does not cost
-/// the item its backup. `None` once the run has been stopped.
+/// the item its backup, and an outage costs no item at all. `None` once the run has
+/// been stopped.
 async fn fetch_file(
     adapter: &dyn PlatformAdapter,
     item: &PendingItem,
     media: &MediaRef,
     control: &RunControl,
+    progress: &ProgressTx,
 ) -> Option<std::result::Result<FetchedMedia, AdapterError>> {
     let mut delays = FETCH_RETRY_DELAYS.iter();
     loop {
@@ -401,13 +405,37 @@ async fn fetch_file(
             return None;
         }
         let result = adapter.fetch_media(&item.item_ref, media).await;
-        match (&result, delays.next()) {
-            (Err(AdapterError::Transport(_)), Some(delay)) => {
-                if !wait(*delay, control).await {
-                    return None;
-                }
+        if !matches!(result, Err(AdapterError::Transport(_))) {
+            return Some(result);
+        }
+        if let Some(delay) = delays.next() {
+            if !wait(*delay, control).await {
+                return None;
             }
-            _ => return Some(result),
+            continue;
+        }
+        // Out of retries: a platform that still answers points at this one file.
+        if adapter.is_reachable().await {
+            return Some(result);
+        }
+        if !wait_for_connection(adapter, control, progress).await {
+            return None;
+        }
+        delays = FETCH_RETRY_DELAYS.iter();
+    }
+}
+
+/// Holds the run until the platform answers again, instead of failing file after
+/// file while it is out of reach. False once the run has been stopped.
+async fn wait_for_connection(adapter: &dyn PlatformAdapter, control: &RunControl, progress: &ProgressTx) -> bool {
+    let _ = progress.send(ProgressEvent::Offline);
+    loop {
+        if !wait(CONNECTION_POLL, control).await {
+            return false;
+        }
+        if adapter.is_reachable().await {
+            let _ = progress.send(ProgressEvent::Online);
+            return true;
         }
     }
 }
@@ -435,12 +463,13 @@ async fn archive_item(
     item: &PendingItem,
     allow_lost_files: bool,
     control: &RunControl,
+    progress: &ProgressTx,
 ) -> Result<ArchiveResult> {
     let mut files = Vec::with_capacity(item.media.len());
     let mut lost_reasons = Vec::new();
     let mut result = ArchiveResult::Archived;
     for media in &item.media {
-        match fetch_file(adapter, item, media, control).await {
+        match fetch_file(adapter, item, media, control, progress).await {
             None => {
                 result = ArchiveResult::Stopped;
                 break;
@@ -802,8 +831,11 @@ mod tests {
         inner: FakeAdapter,
         items: Vec<Item>,
         fetch: Box<dyn Fn(&MediaRef, usize) -> std::result::Result<FetchedMedia, AdapterError> + Send + Sync>,
+        /// Whether the n-th connection check finds the platform.
+        reachable: Box<dyn Fn(usize) -> bool + Send + Sync>,
         delete_rate_limits: AtomicUsize,
         fetches: AtomicUsize,
+        checks: AtomicUsize,
         journal: Mutex<Vec<String>>,
     }
 
@@ -816,10 +848,17 @@ mod tests {
                 inner: FakeAdapter::with_items(0),
                 items,
                 fetch: Box::new(fetch),
+                reachable: Box::new(|_| true),
                 delete_rate_limits: AtomicUsize::new(0),
                 fetches: AtomicUsize::new(0),
+                checks: AtomicUsize::new(0),
                 journal: Mutex::new(Vec::new()),
             }
+        }
+
+        pub(super) fn with_connection(mut self, reachable: impl Fn(usize) -> bool + Send + Sync + 'static) -> Self {
+            self.reachable = Box::new(reachable);
+            self
         }
 
         pub(super) fn journal(&self) -> Vec<String> {
@@ -862,6 +901,11 @@ mod tests {
         ) -> std::result::Result<FetchedMedia, AdapterError> {
             self.note(format!("fetch {}", media.url));
             (self.fetch)(media, self.fetches.fetch_add(1, Ordering::SeqCst))
+        }
+
+        async fn is_reachable(&self) -> bool {
+            self.note("check connection".into());
+            (self.reachable)(self.checks.fetch_add(1, Ordering::SeqCst))
         }
 
         async fn release_media(&self, file: &FetchedMedia) -> std::result::Result<(), AdapterError> {
@@ -908,7 +952,7 @@ mod tests {
     pub(super) struct MediaRun {
         pub(super) outcome: Result<RunOutcome>,
         pub(super) store: Store,
-        events: Vec<ProgressEvent>,
+        pub(super) events: Vec<ProgressEvent>,
         pub(super) archive: PathBuf,
         req: RunRequest,
     }

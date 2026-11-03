@@ -9,7 +9,7 @@ use lethe_store::FileFailure;
 use super::tests::{downloaded, media_item, run_media, run_media_allowing_lost_files, MediaAdapter, ARCHIVE_KEY};
 use super::RunOutcome;
 use crate::archive::ArchiveExport;
-use crate::RunControl;
+use crate::{EngineError, ProgressEvent, RunControl};
 
 #[tokio::test(start_paused = true)]
 async fn a_network_blip_is_waited_out_before_the_item_counts_as_stuck() {
@@ -28,15 +28,67 @@ async fn a_network_blip_is_waited_out_before_the_item_counts_as_stuck() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_lasting_network_problem_keeps_the_item_after_the_last_retry() {
+async fn a_file_that_keeps_failing_while_the_platform_answers_keeps_its_item() {
     let adapter = Arc::new(MediaAdapter::new(vec![media_item("m", &[("photo", 3)])], |_, _| {
-        Err(AdapterError::Transport("no route to host".into()))
+        Err(AdapterError::Transport("the downloaded file does not match the post".into()))
     }));
 
     let run = run_media(adapter.clone(), RunControl::new()).await;
 
     assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1, ..Default::default() });
-    assert_eq!(adapter.journal(), ["fetch photo"; 4]);
+    assert_eq!(adapter.journal(), ["fetch photo", "fetch photo", "fetch photo", "fetch photo", "check connection"]);
+    assert!(!run.events.iter().any(|event| matches!(event, ProgressEvent::Offline)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_outage_holds_the_run_until_the_platform_answers_again() {
+    let adapter = Arc::new(
+        MediaAdapter::new(vec![media_item("m", &[("photo", 3)])], |_, attempt| {
+            if attempt < 4 {
+                return Err(AdapterError::Transport("no route to host".into()));
+            }
+            Ok(downloaded(b"abc"))
+        })
+        .with_connection(|check| check >= 2),
+    );
+
+    let run = run_media(adapter.clone(), RunControl::new()).await;
+
+    assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 1, skipped: 0, failed: 0, ..Default::default() });
+    let mut expected = vec!["fetch photo"; 4];
+    expected.extend(["check connection"; 3]);
+    expected.extend(["fetch photo", "release 1", "delete m"]);
+    assert_eq!(adapter.journal(), expected);
+    let connection: Vec<_> = run
+        .events
+        .iter()
+        .filter(|event| matches!(event, ProgressEvent::Offline | ProgressEvent::Online))
+        .collect();
+    assert!(matches!(connection[..], [ProgressEvent::Offline, ProgressEvent::Online]), "{connection:?}");
+    assert!(!run.events.iter().any(|event| matches!(event, ProgressEvent::Deleting { failed: 1.., .. })));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_run_waiting_for_the_connection_can_be_stopped() {
+    let control = RunControl::new();
+    let stop = control.clone();
+    let adapter = Arc::new(
+        MediaAdapter::new(vec![media_item("m", &[("photo", 3)])], |_, _| {
+            Err(AdapterError::Transport("no route to host".into()))
+        })
+        .with_connection(move |check| {
+            if check == 1 {
+                stop.stop();
+            }
+            false
+        }),
+    );
+
+    let run = run_media(adapter.clone(), control).await;
+
+    assert!(matches!(run.outcome, Err(EngineError::Aborted)));
+    assert_eq!(run.store.unsaved_files("media", 10).unwrap().total, 0, "an outage is not the file's fault");
+    assert!(!adapter.journal().contains(&"delete m".to_string()));
 }
 
 #[tokio::test]

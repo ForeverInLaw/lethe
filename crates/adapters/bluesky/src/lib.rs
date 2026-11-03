@@ -277,6 +277,12 @@ impl PlatformAdapter for BlueskyAdapter {
         Ok(FetchedMedia { path, handle: 0 })
     }
 
+    /// Any answer from the PDS, a refusal included, means it is there.
+    async fn is_reachable(&self) -> bool {
+        let answer = self.agent.api.com.atproto.server.describe_server().await;
+        !matches!(answer.map_err(map_err), Err(AdapterError::Transport(_)))
+    }
+
     async fn release_media(&self, file: &FetchedMedia) -> Result<()> {
         tokio::fs::remove_file(&file.path).await.map_err(io_error)
     }

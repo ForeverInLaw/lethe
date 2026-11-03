@@ -340,6 +340,14 @@ pub trait PlatformAdapter: Send + Sync {
         ))
     }
 
+    /// Whether the platform answers right now. Core asks once a file has used up its
+    /// retries on network errors, to tell an outage, which the run waits out, from a
+    /// problem with that one file. An adapter that cannot tell says yes, and the file
+    /// counts as failed.
+    async fn is_reachable(&self) -> bool {
+        true
+    }
+
     /// Removes the plaintext local copy made by `fetch_media`.
     async fn release_media(&self, _file: &FetchedMedia) -> Result<()> {
         Ok(())
