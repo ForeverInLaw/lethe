@@ -29,9 +29,10 @@ pub(crate) fn needle(search: &str) -> String {
     fold(search.trim())
 }
 
-/// Lower case, composed, with ё read as е.
+/// Unicode case folding of the composed text, with ё read as е. Lowercasing alone
+/// would keep σ and a word-final ς apart.
 fn fold(text: &str) -> String {
-    fold_yo_ye(text).to_lowercase()
+    caseless::default_case_fold_str(&fold_yo_ye(text))
 }
 
 /// NFC-normalize and fold ё/Ё → е/Е so Cyrillic searches match as users expect.
@@ -70,9 +71,12 @@ mod tests {
             texted("cat", "Котлета на ужин"),
             texted("dog", "Собака"),
             snap("silent", ItemState::Pending),
+            // Lowercasing turns a word-final Σ into ς; folding reads every sigma as σ.
+            texted("road", "ΟΔΟΣ"),
         ]);
 
         assert_eq!(found(&s, "кОТ"), ["cat"]);
+        assert_eq!(found(&s, "οδοσ"), ["road"]);
     }
 
     #[test]
