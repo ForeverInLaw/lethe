@@ -467,7 +467,10 @@ mod tests {
         let scratch = Scratch::new();
         let record = br#"{"platform_id":"1","media":[{"url":"u","file_name":"clip.mp4","archived_bytes":6,"chunks":2}]}"#;
         let buf = archive(&[MANIFEST, record, b"abc", b"def"]);
-        let first_chunk_read = buf.len() as u64 - (4 + 3 + 17) - (4 + 17);
+        // Each frame is a 4-byte length, the chunk and 17 bytes of authentication;
+        // after the first chunk come the second one and the sealing frame.
+        let frame = |chunk: u64| 4 + chunk + 17;
+        let first_chunk_read = buf.len() as u64 - frame(3) - frame(0);
         let mut seen = Vec::new();
 
         let result = ArchiveExport::open(buf.as_slice(), &KEY)
