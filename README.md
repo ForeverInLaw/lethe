@@ -11,7 +11,7 @@ depend on `untrace`.**
 | `lethe-adapter` | The platform contract (transport-free): `PlatformAdapter`, `AuthProvider`, types. |
 | `lethe-net` | The single egress chokepoint + allowlist + request log. |
 | `lethe-store` | SQLCipher run-state (checkpoints, activity log, receipts). |
-| `lethe-crypto` | secretstream archive container + Ed25519 receipts. |
+| `lethe-crypto` | secretstream archive container + Ed25519 receipts ([receipt file](docs/receipt-file.md)). |
 | `lethe-core` | Two-phase pipeline, per-account scheduler, filter predicate, run control. |
 | `adapters/bluesky` | M1 tracer (AT Protocol). |
 | `adapters/vk` | M1 #2 (stub). |
