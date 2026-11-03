@@ -4,6 +4,10 @@
 //! native TDLib. Use `tdlib-docs` with `cargo check` to type-check generated
 //! TDLib bindings; test binaries still need native tdjson symbols.
 
+use std::future::Future;
+use std::pin::pin;
+
+use futures::future::{self, Either};
 use lethe_adapter::{AdapterError, DeleteReach, FetchedMedia, MediaRef, PlatformRecord};
 use tdlib_rs::{enums, functions, types};
 
@@ -213,12 +217,15 @@ fn message_ref(message: &types::Message, delete_reach: DeleteReach) -> Result<Te
 }
 
 /// Downloads one of a message's files to TDLib's files directory. Re-reads the
-/// message so the file id and its server reference are current.
+/// message so the file id and its server reference are current. TDLib waits out a
+/// lost connection without returning, so the download is called off once
+/// `connection_lost` completes and fails as a network error.
 pub async fn download_message_file(
     client_id: TdlibClientId,
     chat_id: i64,
     message_id: i64,
     unique_id: &str,
+    connection_lost: impl Future<Output = ()>,
 ) -> Result<FetchedMedia, AdapterError> {
     let enums::Message::Message(message) =
         functions::get_message(chat_id, message_id, client_id.raw())
@@ -230,9 +237,19 @@ pub async fn download_message_file(
         .find(|file| file.remote.unique_id == unique_id)
         .ok_or_else(|| AdapterError::FileRefused("the message no longer has this file".into()))?;
 
-    let fetched = functions::download_file(file.id, DOWNLOAD_PRIORITY, 0, 0, true, client_id.raw())
-        .await
-        .map_err(map_download_error)
+    let download = functions::download_file(file.id, DOWNLOAD_PRIORITY, 0, 0, true, client_id.raw());
+    let downloaded = match future::select(pin!(download), pin!(connection_lost)).await {
+        Either::Left((downloaded, _)) => downloaded.map_err(map_download_error),
+        Either::Right(((), _)) => {
+            let cancelled = functions::cancel_download_file(file.id, false, client_id.raw()).await;
+            let lost = "the connection to Telegram was lost";
+            Err(AdapterError::Transport(match cancelled {
+                Ok(_) => lost.into(),
+                Err(error) => format!("{lost}, and the download kept going: {}", error.message),
+            }))
+        }
+    };
+    let fetched = downloaded
         .and_then(|enums::File::File(downloaded)| {
             let bytes_on_disk =
                 std::fs::metadata(&downloaded.local.path).map_or(0, |meta| meta.len());
