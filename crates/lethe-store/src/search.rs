@@ -60,7 +60,7 @@ mod tests {
     use lethe_adapter::MediaRef;
 
     use crate::tests::{run_with, snap};
-    use crate::{ItemGroup, ItemQuery, ItemSnapshot, ItemState, Store};
+    use crate::{ItemFilter, ItemGroup, ItemQuery, ItemSnapshot, ItemState, Store};
 
     fn texted(id: &str, text: &str) -> ItemSnapshot {
         ItemSnapshot {
@@ -70,7 +70,7 @@ mod tests {
     }
 
     fn found(store: &Store, search: &str) -> Vec<String> {
-        let query = ItemQuery { search, limit: 10, ..Default::default() };
+        let query = ItemQuery { filter: ItemFilter { search, ..Default::default() }, limit: 10, ..Default::default() };
         let rows = store.preview_items("r", &query).unwrap();
         rows.into_iter().map(|row| row.platform_id).collect()
     }
@@ -127,7 +127,8 @@ mod tests {
             typed("poll", "poll", Some("tea or coffee")),
         ]);
         let found = |search, subtypes: &[&str]| {
-            let query = ItemQuery { search, matching_subtypes: subtypes, limit: 10, ..Default::default() };
+            let filter = ItemFilter { search, matching_subtypes: subtypes, ..Default::default() };
+            let query = ItemQuery { filter, limit: 10, ..Default::default() };
             let rows = s.preview_items("r", &query).unwrap();
             rows.into_iter().map(|row| (row.platform_id, row.subtype)).collect::<Vec<_>>()
         };
@@ -154,11 +155,9 @@ mod tests {
         ]);
         let page = |offset| {
             let query = ItemQuery {
-                group: ItemGroup::Protected,
-                search: " отпуск ",
+                filter: ItemFilter { group: ItemGroup::Protected, search: " отпуск ", ..Default::default() },
                 offset,
                 limit: 1,
-                ..Default::default()
             };
             let rows = s.preview_items("r", &query).unwrap();
             rows.into_iter().map(|row| row.platform_id).collect::<Vec<_>>()

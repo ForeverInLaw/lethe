@@ -6,6 +6,7 @@ use lethe_adapter::{ContentType, DeleteReach, ItemRef, MediaRef, Outcome, Platfo
 use rusqlite::{params, Connection, OptionalExtension};
 
 mod file_facts;
+mod filter;
 mod pending;
 mod retention;
 mod scopes;
@@ -14,6 +15,7 @@ mod state;
 mod unsaved_files;
 pub use pending::{Consents, PendingConsents, PendingMedia};
 pub use scopes::{ScopeCount, ScopeOutcome};
+pub use filter::{ItemFilter, ItemGroup};
 pub use search::fold_yo_ye;
 pub use state::{FileFailure, ItemState, RunState};
 pub use unsaved_files::{FileRetryRun, UnsavedCursor, UnsavedFiles, UnsavedItem};
@@ -103,42 +105,10 @@ pub struct ItemRow {
     pub only_for_self: bool,
 }
 
-/// Which preview rows a list shows.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ItemGroup {
-    /// What the person can choose about: what goes and what they protected.
-    #[default]
-    All,
-    Protected,
-    /// Of `All`, what only this account would stop seeing.
-    OnlyForSelf,
-    /// What the platform does not let this account delete.
-    Undeletable,
-}
-
-impl ItemGroup {
-    fn condition(self) -> String {
-        const CHOOSABLE: &str = "state IN ('pending', 'protected')";
-        match self {
-            ItemGroup::All => CHOOSABLE.into(),
-            ItemGroup::Protected => "state = 'protected'".into(),
-            ItemGroup::OnlyForSelf => format!("{CHOOSABLE} AND {}", pending::ONLY_FOR_SELF),
-            ItemGroup::Undeletable => "state = 'undeletable'".into(),
-        }
-    }
-}
-
-/// Which preview rows to page through. Rows that already ran are never listed.
+/// One page of preview rows. Rows that already ran are never listed.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ItemQuery<'a> {
-    pub group: ItemGroup,
-    pub content_type: Option<ContentType>,
-    /// Text the rows must contain. Blank lists every row.
-    pub search: &'a str,
-    /// Subtypes whose wording holds `search`. The app words them, so it knows which
-    /// ones a search names; their rows match as well.
-    pub matching_subtypes: &'a [&'a str],
+    pub filter: ItemFilter<'a>,
     pub offset: u32,
     pub limit: u32,
 }
@@ -296,23 +266,22 @@ impl Store {
             "SELECT platform_id, content_type, created_at, text, state, delete_reach, subtype,
                     {}, {}
              FROM items
-             WHERE run_id = ?1 AND {}
-               AND (?2 IS NULL OR content_type = ?2) AND {}
+             WHERE {}
              ORDER BY created_at DESC, platform_id
-             LIMIT ?3 OFFSET ?4",
+             LIMIT ?5 OFFSET ?6",
             file_facts::FILE_NAME,
             file_facts::FILE_SIZE,
-            query.group.condition(),
-            search::matches(5, 6)
+            query.filter.condition(),
         ))?;
+        let (run_id, content_type, needle, subtypes) = query.filter.params(run_id)?;
         let rows = stmt.query_map(
             params![
                 run_id,
-                query.content_type.map(content_type_str),
+                content_type,
+                needle,
+                subtypes,
                 i64::from(query.limit),
                 i64::from(query.offset),
-                search::needle(query.search),
-                serde_json::to_string(query.matching_subtypes)?,
             ],
             |r| {
                 Ok(ItemRow {
@@ -718,7 +687,10 @@ mod tests {
                 .preview_items(
                     "r",
                     &ItemQuery {
-                        content_type: Some(ContentType::Reaction),
+                        filter: ItemFilter {
+                            content_type: Some(ContentType::Reaction),
+                            ..Default::default()
+                        },
                         ..all
                     }
                 )
@@ -729,7 +701,10 @@ mod tests {
             .preview_items(
                 "r",
                 &ItemQuery {
-                    group: ItemGroup::Protected,
+                    filter: ItemFilter {
+                        group: ItemGroup::Protected,
+                        ..Default::default()
+                    },
                     ..all
                 },
             )
@@ -754,7 +729,10 @@ mod tests {
             s.preview_items(
                 "r",
                 &ItemQuery {
-                    group,
+                    filter: ItemFilter {
+                        group,
+                        ..Default::default()
+                    },
                     limit: 10,
                     ..Default::default()
                 },
