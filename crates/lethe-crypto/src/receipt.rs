@@ -130,6 +130,8 @@ fn verify_detached(message: &[u8], public_key_hex: &str, signature_hex: &str) ->
 /// Names the layout of a `ReceiptFile`, so a later layout can be told apart.
 const RECEIPT_FILE_FORMAT: &str = "lethe-receipt/1";
 const RECEIPT_FILE_ALGORITHM: &str = "ed25519";
+/// Where someone handed a receipt file finds how to check it.
+const RECEIPT_FILE_ABOUT: &str = "https://github.com/ForeverInLaw/lethe/blob/master/docs/receipt-file.md";
 
 /// A receipt as a JSON file a person can hand over, checked without the app or its
 /// store: an Ed25519 signature by `public_key_hex` over the UTF-8 bytes of
@@ -137,6 +139,8 @@ const RECEIPT_FILE_ALGORITHM: &str = "ed25519";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReceiptFile {
     format: String,
+    /// A link to the layout and to how to check it; the check does not read it.
+    about: String,
     algorithm: String,
     /// The summary exactly as it was signed. It stays text, because encoding it
     /// again could change the bytes the signature covers.
@@ -150,6 +154,7 @@ impl ReceiptFile {
     pub fn new(summary_json: String, public_key_hex: String, signature_hex: String) -> Self {
         Self {
             format: RECEIPT_FILE_FORMAT.into(),
+            about: RECEIPT_FILE_ABOUT.into(),
             algorithm: RECEIPT_FILE_ALGORITHM.into(),
             summary: summary_json,
             public_key_hex,

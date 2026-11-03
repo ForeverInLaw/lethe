@@ -7,6 +7,7 @@ its own Ed25519 key. Anyone can check the file without the app.
 ```json
 {
   "format": "lethe-receipt/1",
+  "about": "https://github.com/ForeverInLaw/lethe/blob/master/docs/receipt-file.md",
   "algorithm": "ed25519",
   "summary": "{\"run_id\":\"…\",\"platform\":\"telegram\",\"account_label\":\"…\",\"started_epoch_secs\":…,\"finished_epoch_secs\":…,\"deleted\":37,\"skipped\":2,\"failed\":1}",
   "public_key_hex": "…",
