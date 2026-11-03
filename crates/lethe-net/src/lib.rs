@@ -148,11 +148,14 @@ mod tests {
             socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
             let addr = socket.local_addr().unwrap();
             let listener = socket.listen(0).unwrap();
-            let connect = || tokio::time::timeout(Duration::from_millis(200), tokio::net::TcpStream::connect(addr));
+            // Loopback connects at once, and Linux resends a dropped SYN only after 1 s,
+            // so an attempt still waiting after 500 ms is one the full queue dropped.
+            let connect = || tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(addr));
             let mut queued = Vec::new();
             for _ in 0..64 {
                 match connect().await {
                     Ok(Ok(stream)) => queued.push(stream),
+                    _ if queued.is_empty() => panic!("the first connection did not open"),
                     _ => return Self { addr, _listener: listener, _queued: queued },
                 }
             }
