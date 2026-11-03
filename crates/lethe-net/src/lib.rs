@@ -127,6 +127,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_host_off_the_allowlist_is_logged_and_never_contacted() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let egress = Egress::new(["bsky.social".to_owned()]);
+        let request = egress.client().get(format!("http://{addr}/")).build().unwrap();
+
+        let outcome = egress.execute(request).await;
+
+        assert!(matches!(outcome, Err(EgressError::Blocked(host)) if host == "127.0.0.1"));
+        let log = egress.log();
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].allowed);
+        let contacted = tokio::time::timeout(Duration::from_millis(200), server.accept()).await;
+        assert!(contacted.is_err(), "a blocked request must not open a connection");
+    }
+
+    #[tokio::test]
     async fn a_server_that_never_answers_ends_in_an_error() {
         let addr = server_going_silent_after(b"").await;
         let egress = impatient_egress();

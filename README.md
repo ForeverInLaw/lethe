@@ -16,12 +16,10 @@ depend on `untrace`.**
 | `adapters/bluesky` | M1 tracer (AT Protocol). |
 | `adapters/vk` | M1 #2 (stub). |
 | `adapters/telegram` | M1 #3 (TDLib-gated bridge; one live run passed on a test group). |
-| `lethe-cli` | Headless vertical runner — reproducible-build & zero-egress CI target. |
 
 ## Invariants
 
-- **One-way deps:** `untrace/* → lethe/*`, never the reverse. `lethe-cli` builds
-  and runs a full vertical with no `untrace` dependency.
+- **One-way deps:** `untrace/* → lethe/*`, never the reverse.
 - **dry-run == executed** is structural (two-phase snapshot; `lethe-core::pipeline`).
 - **Idempotent resume:** key = `(run_id, platform_id)`; already-gone ⇒ deleted.
 - **No own sockets:** adapters route through `lethe_net::Egress` only.

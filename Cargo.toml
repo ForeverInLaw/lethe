@@ -1,7 +1,5 @@
 # Lethe — open-core deletion engine (PUBLIC repo).
 # INVARIANT: no crate here may depend on the `untrace` tree.
-# `lethe-cli` must build + run a full vertical with zero `untrace` deps
-# (it is the reproducible-build / zero-egress CI target).
 
 [workspace]
 resolver = "2"
@@ -14,7 +12,6 @@ members = [
     "crates/adapters/bluesky",
     "crates/adapters/vk",
     "crates/adapters/telegram",
-    "crates/lethe-cli",
 ]
 
 [workspace.package]
