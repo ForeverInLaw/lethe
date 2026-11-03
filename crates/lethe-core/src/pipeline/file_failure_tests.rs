@@ -88,7 +88,7 @@ async fn a_run_waiting_for_the_connection_can_be_stopped() {
     let run = run_media(adapter.clone(), control).await;
 
     assert!(matches!(run.outcome, Err(EngineError::Aborted)));
-    assert_eq!(run.store.unsaved_files("media", 10).unwrap().total, 0, "an outage is not the file's fault");
+    assert_eq!(run.store.unsaved_files("media").unwrap().total, 0, "an outage is not the file's fault");
     assert!(!adapter.journal().contains(&"delete m".to_string()));
 }
 
@@ -136,9 +136,10 @@ async fn an_item_that_stayed_is_listed_with_why() {
 
     let run = run_media(adapter, RunControl::new()).await;
 
-    let unsaved = run.store.unsaved_files("media", 10).unwrap();
+    let unsaved = run.store.unsaved_files("media").unwrap();
     assert_eq!((unsaved.total, unsaved.unavailable), (2, 1));
-    let failure_of = |id: &str| unsaved.items.iter().find(|item| item.platform_id == id).unwrap().failure;
+    let items = run.store.unsaved_items("media", 0, 10).unwrap();
+    let failure_of = |id: &str| items.iter().find(|item| item.platform_id == id).unwrap().failure;
     assert_eq!(failure_of("lost"), FileFailure::Unavailable);
     assert_eq!(failure_of("cut"), FileFailure::Unreachable);
 }
@@ -183,7 +184,7 @@ async fn consent_does_not_cover_a_file_that_is_only_out_of_reach() {
 
     assert_eq!(run.outcome.as_ref().unwrap(), &RunOutcome { deleted: 0, skipped: 0, failed: 1, ..Default::default() });
     assert!(!adapter.journal().contains(&"delete m".to_string()));
-    assert_eq!(run.store.unsaved_files("media", 10).unwrap().total, 1);
+    assert_eq!(run.store.unsaved_files("media").unwrap().total, 1);
 }
 
 #[tokio::test]
@@ -199,7 +200,7 @@ async fn consent_does_not_cover_an_error_that_is_not_a_refusal() {
         let run = run_media_allowing_lost_files(adapter.clone()).await;
 
         assert!(!adapter.journal().contains(&"delete m".to_string()), "{error}");
-        assert_eq!(run.store.unsaved_files("media", 10).unwrap().unavailable, 0, "{error}");
+        assert_eq!(run.store.unsaved_files("media").unwrap().unavailable, 0, "{error}");
     }
 }
 
@@ -221,6 +222,6 @@ async fn stopping_the_run_keeps_the_list_of_what_stayed() {
     let run = run_media(adapter, control).await;
 
     assert!(run.outcome.is_err());
-    let listed: Vec<_> = run.store.unsaved_files("media", 10).unwrap().items.into_iter().map(|item| item.platform_id).collect();
+    let listed: Vec<_> = run.store.unsaved_items("media", 0, 10).unwrap().into_iter().map(|item| item.platform_id).collect();
     assert_eq!(listed, ["kept"]);
 }

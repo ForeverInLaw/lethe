@@ -21,13 +21,12 @@ pub struct UnsavedItem {
     pub failure: FileFailure,
 }
 
-/// What stayed in a run because of its files: the counts, and the first rows.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// How much stayed in a run because of its files. `Store::unsaved_items` lists it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct UnsavedFiles {
     pub total: u64,
     /// How many of them may go without the file, with the person's consent.
     pub unavailable: u64,
-    pub items: Vec<UnsavedItem>,
 }
 
 /// The follow-up run made for a retry, in preview.
@@ -66,21 +65,25 @@ impl Store {
         Ok(())
     }
 
-    pub fn unsaved_files(&self, run_id: &str, limit: u32) -> Result<UnsavedFiles> {
-        let (total, unavailable) = self.conn.query_row(
+    pub fn unsaved_files(&self, run_id: &str) -> Result<UnsavedFiles> {
+        Ok(self.conn.query_row(
             &format!(
                 "SELECT COUNT(*), COALESCE(SUM(items.file_failure = 'unavailable'), 0)
                  FROM items WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE}"
             ),
             params![run_id],
-            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-        )?;
+            |r| Ok(UnsavedFiles { total: r.get::<_, i64>(0)? as u64, unavailable: r.get::<_, i64>(1)? as u64 }),
+        )?)
+    }
+
+    /// One page of what stayed in a run because of its files, newest first.
+    pub fn unsaved_items(&self, run_id: &str, offset: u32, limit: u32) -> Result<Vec<UnsavedItem>> {
         let mut stmt = self.conn.prepare(&format!(
             "SELECT platform_id, created_at, text, file_failure, subtype FROM items
-             WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE} ORDER BY created_at DESC, platform_id LIMIT ?2"
+             WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE} ORDER BY created_at DESC, platform_id LIMIT ?2 OFFSET ?3"
         ))?;
         let items = stmt
-            .query_map(params![run_id, limit], |r| {
+            .query_map(params![run_id, limit, offset], |r| {
                 Ok(UnsavedItem {
                     platform_id: r.get(0)?,
                     subtype: r.get(4)?,
@@ -90,7 +93,7 @@ impl Store {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(UnsavedFiles { total, unavailable, items })
+        Ok(items)
     }
 
     /// Opens a new run holding what stayed in `from_run_id`, ready to execute. The
@@ -219,8 +222,8 @@ mod tests {
     }
 
     fn listed(store: &Store, run_id: &str) -> Vec<String> {
-        let unsaved = store.unsaved_files(run_id, 50).unwrap();
-        unsaved.items.into_iter().map(|item| item.platform_id).collect()
+        let items = store.unsaved_items(run_id, 0, 50).unwrap();
+        items.into_iter().map(|item| item.platform_id).collect()
     }
 
     #[test]
@@ -239,27 +242,32 @@ mod tests {
             )
             .unwrap();
 
-        let unsaved = store.unsaved_files("r1", 50).unwrap();
+        let unsaved = store.unsaved_files("r1").unwrap();
+        let items = store.unsaved_items("r1", 0, 50).unwrap();
 
         assert_eq!((unsaved.total, unsaved.unavailable), (2, 1));
-        assert_eq!(unsaved.items[0].platform_id, "file");
-        assert_eq!(unsaved.items[0].failure, FileFailure::Unavailable);
-        assert_eq!(unsaved.items[0].text.as_deref(), Some("text of file"));
-        assert_eq!(unsaved.items[1].failure, FileFailure::Unreachable);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].platform_id, "file");
+        assert_eq!(items[0].failure, FileFailure::Unavailable);
+        assert_eq!(items[0].text.as_deref(), Some("text of file"));
+        assert_eq!(items[1].failure, FileFailure::Unreachable);
     }
 
     #[test]
-    fn the_list_counts_every_row_past_its_limit() {
+    fn the_list_reads_page_by_page_to_its_last_row() {
         let mut store = store();
         run_of(&store, "r1", ACCOUNT, &["a", "b", "c"]);
         for id in ["a", "b", "c"] {
             fail(&mut store, "r1", id, FileFailure::Unavailable);
         }
+        let page = |offset| -> Vec<String> {
+            let items = store.unsaved_items("r1", offset, 2).unwrap();
+            items.into_iter().map(|item| item.platform_id).collect()
+        };
 
-        let unsaved = store.unsaved_files("r1", 2).unwrap();
-
-        assert_eq!(unsaved.total, 3);
-        assert_eq!(unsaved.items.len(), 2);
+        assert_eq!(page(0), ["a", "b"]);
+        assert_eq!(page(2), ["c"]);
+        assert_eq!(store.unsaved_files("r1").unwrap().total, 3);
     }
 
     #[test]
