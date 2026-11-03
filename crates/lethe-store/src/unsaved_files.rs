@@ -15,6 +15,7 @@ pub(crate) const WAITS_ON_A_FILE: &str = "items.state = 'failed' AND items.file_
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsavedItem {
     pub platform_id: String,
+    pub subtype: Option<String>,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
     pub failure: FileFailure,
@@ -75,13 +76,14 @@ impl Store {
             |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
         )?;
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT platform_id, created_at, text, file_failure FROM items
+            "SELECT platform_id, created_at, text, file_failure, subtype FROM items
              WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE} ORDER BY created_at DESC, platform_id LIMIT ?2"
         ))?;
         let items = stmt
             .query_map(params![run_id, limit], |r| {
                 Ok(UnsavedItem {
                     platform_id: r.get(0)?,
+                    subtype: r.get(4)?,
                     created_at_secs: r.get(1)?,
                     text: r.get(2)?,
                     failure: FileFailure::from_stored(&r.get::<_, String>(3)?),
@@ -114,9 +116,9 @@ impl Store {
         let items = tx.execute(
             &format!(
                 "INSERT INTO items (run_id, platform_id, content_type, created_at, token, text, media_json,
-                                    platform_record, backup_gap, delete_reach, scope_id, state)
+                                    platform_record, backup_gap, delete_reach, scope_id, subtype, state)
                  SELECT ?2, platform_id, content_type, created_at, token, text, media_json,
-                        platform_record, backup_gap, delete_reach, scope_id, ?3
+                        platform_record, backup_gap, delete_reach, scope_id, subtype, ?3
                  FROM items WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE}"
             ),
             params![from_run_id, new_run_id, ItemState::Pending.as_str()],
@@ -191,6 +193,7 @@ mod tests {
             .map(|id| ItemSnapshot {
                 item_ref: ItemRef { platform_id: (*id).into(), token: Some(format!("token-{id}")) },
                 content_type: ContentType::Post,
+                subtype: None,
                 created_at_secs: Some(100),
                 text: Some(format!("text of {id}")),
                 media: vec![MediaRef {

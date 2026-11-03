@@ -380,6 +380,7 @@ fn record_to_item(
     let files = record_files(&rec.value)?;
     Ok(Item {
         content_type,
+        subtype: None,
         created_at,
         text,
         engagement: Engagement::default(),

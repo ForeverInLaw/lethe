@@ -221,6 +221,9 @@ pub struct ItemRef {
 #[derive(Debug, Clone)]
 pub struct Item {
     pub content_type: ContentType,
+    /// What the item is when its content type is too coarse, as a stable key the
+    /// app words: `photo`, `poll`, `chat_join`. None for plain text.
+    pub subtype: Option<&'static str>,
     pub created_at: Option<OffsetDateTime>,
     /// Text for keyword/regex predicate (None if not applicable).
     pub text: Option<String>,

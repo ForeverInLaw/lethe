@@ -62,7 +62,10 @@ pub struct TelegramMessageRef {
     pub message_id: i64,
     pub sent_at_epoch_secs: i32,
     pub kind: TelegramMessageKind,
-    /// Message text or media caption, kept in the backup with the message.
+    /// What the message is, for anything but plain text: `photo`, `poll`, `chat_join`.
+    pub subtype: Option<&'static str>,
+    /// Message text or media caption, kept in the backup with the message. A poll,
+    /// contact or venue has its question, name or title here.
     pub text: Option<String>,
     pub media: Vec<MediaRef>,
     /// The whole message, which is all the backup has of a poll, contact or location.
@@ -205,6 +208,7 @@ fn message_ref(message: &types::Message, delete_reach: DeleteReach) -> Result<Te
         message_id: message.id,
         sent_at_epoch_secs: message.date,
         kind: classify_message_content(&message.content),
+        subtype: message_subtype(message),
         text: extract_message_text(&message.content),
         media: message_files(&message.content)
             .into_iter()
@@ -348,19 +352,94 @@ fn classify_message_content(content: &enums::MessageContent) -> TelegramMessageK
     }
 }
 
+/// A stable key for what the message is, which the app words the way Telegram
+/// does. Plain text needs none. Kinds a user rarely sends share `service`.
+fn message_subtype(message: &types::Message) -> Option<&'static str> {
+    use enums::MessageContent::*;
+    Some(match &message.content {
+        MessageText(_) | MessageAnimatedEmoji(_) => return None,
+        MessageAnimation(_) => "animation",
+        MessageAudio(_) => "audio",
+        MessageDocument(_) => "document",
+        MessagePaidMedia(_) => "paid_media",
+        MessagePhoto(_) => "photo",
+        MessageSticker(_) => "sticker",
+        MessageVideo(_) => "video",
+        MessageVideoNote(_) => "video_note",
+        MessageVoiceNote(_) => "voice_note",
+        MessageExpiredPhoto | MessageExpiredVideo | MessageExpiredVideoNote
+        | MessageExpiredVoiceNote => "expired_media",
+        MessageLocation(_) => "location",
+        MessageVenue(_) => "venue",
+        MessageContact(_) => "contact",
+        MessageDice(_) | MessageStakeDice(_) => "dice",
+        MessageGame(_) => "game",
+        MessagePoll(_) => "poll",
+        MessageStory(_) => "story",
+        MessageChecklist(_) => "checklist",
+        MessageChecklistTasksDone(_) | MessageChecklistTasksAdded(_) => "checklist_changed",
+        MessageInvoice(_) => "invoice",
+        MessageCall(_) => "call",
+        MessageGroupCall(_) | MessageVideoChatScheduled(_) | MessageVideoChatStarted(_)
+        | MessageVideoChatEnded(_) | MessageInviteVideoChatParticipants(_) => "video_chat",
+        MessageBasicGroupChatCreate(_) | MessageSupergroupChatCreate(_) => "chat_create",
+        MessageChatChangeTitle(_) => "chat_change_title",
+        MessageChatChangePhoto(_) => "chat_change_photo",
+        MessageChatDeletePhoto => "chat_delete_photo",
+        MessageChatAddMembers(_) => "chat_add_members",
+        MessageChatJoinByLink | MessageChatJoinByRequest => "chat_join",
+        MessageChatDeleteMember(member) if is_from_user(message, member.user_id) => "chat_leave",
+        MessageChatDeleteMember(_) => "chat_remove_member",
+        MessageChatUpgradeTo(_) | MessageChatUpgradeFrom(_) => "chat_upgrade",
+        MessagePinMessage(_) => "pin_message",
+        MessageScreenshotTaken => "screenshot_taken",
+        MessageChatSetBackground(_) | MessageChatSetTheme(_) => "chat_set_theme",
+        MessageChatSetMessageAutoDeleteTime(_) => "auto_delete_timer",
+        MessageForumTopicCreated(_) => "topic_create",
+        MessageForumTopicEdited(_) | MessageForumTopicIsClosedToggled(_)
+        | MessageForumTopicIsHiddenToggled(_) => "topic_change",
+        MessageGameScore(_) => "game_score",
+        MessageContactRegistered => "joined_telegram",
+        MessageGiftedPremium(_) | MessagePremiumGiftCode(_) | MessageGiftedStars(_)
+        | MessageGiftedTon(_) | MessageGiveawayPrizeStars(_) | MessageGift(_)
+        | MessageUpgradedGift(_) | MessageRefundedUpgradedGift(_) => "gift",
+        MessageGiveawayCreated(_) | MessageGiveaway(_) | MessageGiveawayCompleted(_)
+        | MessageGiveawayWinners(_) => "giveaway",
+        MessagePaymentSuccessful(_) | MessagePaymentSuccessfulBot(_)
+        | MessagePaymentRefunded(_) => "payment",
+        MessageUnsupported => "unsupported",
+        _ => "service",
+    })
+}
+
+/// The words the user put in a message: its text, caption, or what it names, such
+/// as a poll's question or a new chat title. The keyword filter reads them too.
 fn extract_message_text(content: &enums::MessageContent) -> Option<String> {
+    use enums::MessageContent::*;
     let text = match content {
-        enums::MessageContent::MessageText(text) => &text.text,
-        enums::MessageContent::MessageAnimation(media) => &media.caption,
-        enums::MessageContent::MessageAudio(media) => &media.caption,
-        enums::MessageContent::MessageDocument(media) => &media.caption,
-        enums::MessageContent::MessagePaidMedia(media) => &media.caption,
-        enums::MessageContent::MessagePhoto(media) => &media.caption,
-        enums::MessageContent::MessageVideo(media) => &media.caption,
-        enums::MessageContent::MessageVoiceNote(media) => &media.caption,
+        MessageText(text) => &text.text.text,
+        MessageAnimation(media) => &media.caption.text,
+        MessageAudio(media) => &media.caption.text,
+        MessageDocument(media) => &media.caption.text,
+        MessagePaidMedia(media) => &media.caption.text,
+        MessagePhoto(media) => &media.caption.text,
+        MessageVideo(media) => &media.caption.text,
+        MessageVoiceNote(media) => &media.caption.text,
+        MessageAnimatedEmoji(emoji) => &emoji.emoji,
+        MessageDice(dice) => &dice.emoji,
+        MessagePoll(poll) => &poll.poll.question.text,
+        MessageChecklist(checklist) => &checklist.list.title.text,
+        MessageVenue(venue) => &venue.venue.title,
+        MessageContact(contact) => {
+            let name = format!("{} {}", contact.contact.first_name, contact.contact.last_name);
+            let name = name.trim();
+            return (!name.is_empty()).then(|| name.to_owned());
+        }
+        MessageChatChangeTitle(change) => &change.title,
+        MessageForumTopicCreated(topic) => &topic.name,
         _ => return None,
     };
-    (!text.text.is_empty()).then(|| text.text.clone())
+    (!text.is_empty()).then(|| text.clone())
 }
 
 struct Attachment<'a> {
@@ -750,6 +829,78 @@ mod tests {
         let record = record_of(content);
         assert_eq!(record["content"]["poll"]["question"]["text"], "tea or coffee");
         assert_eq!(record["content"]["poll"]["options"][0]["text"]["text"], "tea");
+    }
+
+    fn described(message: types::Message) -> (Option<&'static str>, Option<String>) {
+        let message = message_ref(&message, DeleteReach::Everyone).unwrap();
+        (message.subtype, message.text)
+    }
+
+    fn poll(question: &str) -> enums::MessageContent {
+        enums::MessageContent::MessagePoll(types::MessagePoll {
+            poll: types::Poll {
+                id: 1,
+                question: caption(question),
+                options: Vec::new(),
+                total_voter_count: 0,
+                recent_voter_ids: Vec::new(),
+                is_anonymous: true,
+                r#type: enums::PollType::Regular(types::PollTypeRegular {
+                    allow_multiple_answers: false,
+                }),
+                open_period: 0,
+                close_date: 0,
+                is_closed: false,
+            },
+        })
+    }
+
+    #[test]
+    fn a_poll_says_it_is_a_poll_and_keeps_its_question_as_text() {
+        assert_eq!(
+            described(message_with(poll("tea or coffee"))),
+            (Some("poll"), Some("tea or coffee".into()))
+        );
+    }
+
+    #[test]
+    fn a_service_message_says_what_happened_and_has_no_text() {
+        let joined = enums::MessageContent::MessageChatJoinByLink;
+        let pinned = enums::MessageContent::MessagePinMessage(types::MessagePinMessage { message_id: 3 });
+        assert_eq!(described(message_with(joined)), (Some("chat_join"), None));
+        assert_eq!(described(message_with(pinned)), (Some("pin_message"), None));
+    }
+
+    #[test]
+    fn removing_yourself_from_a_chat_reads_as_leaving_it() {
+        let removed = |user_id| {
+            enums::MessageContent::MessageChatDeleteMember(types::MessageChatDeleteMember { user_id })
+        };
+        // `message_with` sends as user 1.
+        assert_eq!(described(message_with(removed(1))).0, Some("chat_leave"));
+        assert_eq!(described(message_with(removed(2))).0, Some("chat_remove_member"));
+    }
+
+    #[test]
+    fn a_photo_says_it_is_a_photo_and_keeps_its_caption() {
+        let enums::MessageContent::MessagePhoto(mut photo) = photo_message(&[(90, "small")]) else {
+            unreachable!()
+        };
+        photo.caption = caption("at the sea");
+        assert_eq!(
+            described(message_with(enums::MessageContent::MessagePhoto(photo))),
+            (Some("photo"), Some("at the sea".into()))
+        );
+    }
+
+    #[test]
+    fn a_text_message_needs_no_description() {
+        let text = enums::MessageContent::MessageText(types::MessageText {
+            text: caption("hi"),
+            link_preview: None,
+            link_preview_options: None,
+        });
+        assert_eq!(described(message_with(text)), (None, Some("hi".into())));
     }
 
     #[test]
