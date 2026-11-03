@@ -151,6 +151,7 @@ pub async fn snapshot(
             buf.push(ItemSnapshot {
                 item_ref: item.item_ref.clone(),
                 content_type: item.content_type,
+                subtype: item.subtype,
                 created_at_secs: item.created_at.map(|t| t.unix_timestamp()),
                 text: item.text.clone(),
                 media: item.media.clone(),
@@ -581,6 +582,7 @@ mod tests {
                 .map(|i| {
                     Ok(Item {
                         content_type: ContentType::Post,
+                        subtype: None,
                         created_at: None,
                         text: Some(format!("post {i}")),
                         engagement: Engagement::default(),
@@ -997,6 +999,7 @@ mod tests {
     pub(super) fn media_item(id: &str, files: &[(&str, u64)]) -> Item {
         Item {
             content_type: ContentType::Media,
+            subtype: None,
             created_at: None,
             text: Some(format!("caption {id}")),
             engagement: Engagement::default(),

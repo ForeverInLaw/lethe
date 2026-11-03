@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS items (
     file_failure TEXT,               -- unavailable | unreachable: its file was not saved, so it stayed
     delete_reach TEXT    NOT NULL DEFAULT 'everyone', -- everyone | only_for_self | nowhere
     scope_id     TEXT,               -- where the item sits on the platform, such as its chat
+    subtype      TEXT,               -- what it is when content_type is too coarse: photo, poll, chat_join
     state        TEXT    NOT NULL,   -- pending | protected | deleted | skipped | failed | undeletable
     attempts     INTEGER NOT NULL DEFAULT 0,
     last_error   TEXT,

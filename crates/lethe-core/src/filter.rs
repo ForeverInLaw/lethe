@@ -134,6 +134,7 @@ mod tests {
     fn item(text: Option<&str>, likes: Option<u64>) -> Item {
         Item {
             content_type: ContentType::Post,
+            subtype: None,
             created_at: None,
             text: text.map(Into::into),
             engagement: Engagement { likes, ..Default::default() },

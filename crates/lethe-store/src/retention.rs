@@ -70,6 +70,7 @@ mod tests {
                 token: None,
             },
             content_type: ContentType::Post,
+            subtype: None,
             created_at_secs: Some(1),
             text: Some(format!("text of {id}")),
             media: Vec::new(),

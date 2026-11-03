@@ -32,6 +32,8 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 pub struct ItemSnapshot {
     pub item_ref: ItemRef,
     pub content_type: ContentType,
+    /// What the item is when its content type is too coarse; see `Item::subtype`.
+    pub subtype: Option<&'static str>,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
     pub media: Vec<MediaRef>,
@@ -88,6 +90,7 @@ pub struct PreviewCounts {
 pub struct ItemRow {
     pub platform_id: String,
     pub content_type: ContentType,
+    pub subtype: Option<String>,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
     /// `Pending`, `Protected` or `Undeletable`.
@@ -128,6 +131,9 @@ pub struct ItemQuery<'a> {
     pub content_type: Option<ContentType>,
     /// Text the rows must contain. Blank lists every row.
     pub search: &'a str,
+    /// Subtypes whose wording holds `search`. The app words them, so it knows which
+    /// ones a search names; their rows match as well.
+    pub matching_subtypes: &'a [&'a str],
     pub offset: u32,
     pub limit: u32,
 }
@@ -223,8 +229,8 @@ impl Store {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO items
                  (run_id, platform_id, content_type, created_at, token, text, media_json,
-                  platform_record, backup_gap, delete_reach, scope_id, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                  platform_record, backup_gap, delete_reach, scope_id, state, subtype)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
             for it in items {
                 let media_json = serde_json::to_string(&it.media)?;
@@ -241,6 +247,7 @@ impl Store {
                     state::reach_as_str(it.delete_reach),
                     it.scope_id,
                     it.state.as_str(),
+                    it.subtype,
                 ])?;
             }
         }
@@ -281,13 +288,14 @@ impl Store {
     /// Preview rows of one group, newest first.
     pub fn preview_items(&self, run_id: &str, query: &ItemQuery) -> Result<Vec<ItemRow>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT platform_id, content_type, created_at, text, state, delete_reach FROM items
+            "SELECT platform_id, content_type, created_at, text, state, delete_reach, subtype
+             FROM items
              WHERE run_id = ?1 AND {}
                AND (?2 IS NULL OR content_type = ?2) AND {}
              ORDER BY created_at DESC, platform_id
              LIMIT ?3 OFFSET ?4",
             query.group.condition(),
-            search::contains(5)
+            search::matches(5, 6)
         ))?;
         let rows = stmt.query_map(
             params![
@@ -296,11 +304,13 @@ impl Store {
                 i64::from(query.limit),
                 i64::from(query.offset),
                 search::needle(query.search),
+                serde_json::to_string(query.matching_subtypes)?,
             ],
             |r| {
                 Ok(ItemRow {
                     platform_id: r.get(0)?,
                     content_type: parse_content_type_column(r, 1)?,
+                    subtype: r.get(6)?,
                     created_at_secs: r.get(2)?,
                     text: r.get(3)?,
                     // Every group lists only these three states.
@@ -590,6 +600,9 @@ fn migrate_content_columns(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "items", "scope_id")? {
         conn.execute("ALTER TABLE items ADD COLUMN scope_id TEXT", [])?;
     }
+    if !column_exists(conn, "items", "subtype")? {
+        conn.execute("ALTER TABLE items ADD COLUMN subtype TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -615,6 +628,7 @@ mod tests {
                 token: None,
             },
             content_type: ContentType::Post,
+            subtype: None,
             created_at_secs: Some(1),
             text: Some(format!("text {id}")),
             media: vec![MediaRef {

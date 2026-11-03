@@ -18,13 +18,17 @@ pub(crate) fn register(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Rows whose text holds parameter `?{param}`, which `needle` gives. Matches every
-/// row when that parameter is blank.
-pub(crate) fn contains(param: usize) -> String {
-    format!("(?{param} = '' OR instr({FOLD}(text), ?{param}) > 0)")
+/// Rows whose text holds parameter `?{search}`, which `needle` gives, or whose
+/// subtype is in the JSON array `?{subtypes}`. Matches every row when the search
+/// is blank.
+pub(crate) fn matches(search: usize, subtypes: usize) -> String {
+    format!(
+        "(?{search} = '' OR instr({FOLD}(text), ?{search}) > 0
+          OR subtype IN (SELECT value FROM json_each(?{subtypes})))"
+    )
 }
 
-/// The search text as `contains` compares it.
+/// The search text as `matches` compares it.
 pub(crate) fn needle(search: &str) -> String {
     fold(search.trim())
 }
@@ -91,6 +95,31 @@ mod tests {
         assert_eq!(found(&s, "ел"), ["spruce", "tree"]);
         assert_eq!(found(&s, "ЁЛ"), ["spruce", "tree"]);
         assert_eq!(found(&s, "ёж"), ["decomposed"]);
+    }
+
+    #[test]
+    fn preview_items_find_rows_by_the_subtypes_the_search_names() {
+        let typed = |id: &str, subtype, text: Option<&str>| ItemSnapshot {
+            subtype: Some(subtype),
+            text: text.map(Into::into),
+            ..snap(id, ItemState::Pending)
+        };
+        let s = run_with(&[
+            typed("joined", "chat_join", None),
+            typed("pinned", "pin_message", None),
+            typed("poll", "poll", Some("tea or coffee")),
+        ]);
+        let found = |search, subtypes: &[&str]| {
+            let query = ItemQuery { search, matching_subtypes: subtypes, limit: 10, ..Default::default() };
+            let rows = s.preview_items("r", &query).unwrap();
+            rows.into_iter().map(|row| (row.platform_id, row.subtype)).collect::<Vec<_>>()
+        };
+
+        // The app words the subtypes, so it says which ones the search names.
+        assert_eq!(found("joined", &["chat_join"]), [("joined".to_owned(), Some("chat_join".to_owned()))]);
+        assert_eq!(found("coffee", &[]), [("poll".to_owned(), Some("poll".to_owned()))]);
+        // A blank search lists every row, whatever subtypes come with it.
+        assert_eq!(found("", &["chat_join"]).len(), 3);
     }
 
     #[test]
