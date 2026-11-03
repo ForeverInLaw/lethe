@@ -94,7 +94,8 @@ pub(crate) struct ArchiveWriter {
 impl ArchiveWriter {
     /// Refuses a path that already holds a file: that is the backup of what a run
     /// already deleted, and it cannot be carried on, because its stream is sealed or
-    /// cut off.
+    /// cut off. A file whose header could not be written holds nothing yet, so it is
+    /// removed rather than left to be refused as a backup next time.
     pub(crate) fn create(target: &BackupTarget, req: &RunRequest) -> Result<Self> {
         let file = File::create_new(&target.path).map_err(|error| match error.kind() {
             std::io::ErrorKind::AlreadyExists => {
@@ -102,6 +103,12 @@ impl ArchiveWriter {
             }
             _ => io_error(error),
         })?;
+        Self::start(file, target, req).inspect_err(|_| {
+            std::fs::remove_file(&target.path).ok();
+        })
+    }
+
+    fn start(file: File, target: &BackupTarget, req: &RunRequest) -> Result<Self> {
         let mut container = ContainerWriter::create(file, &target.key)?;
         container.write_chunk(&to_json(&Manifest {
             run_id: &req.run_id,
