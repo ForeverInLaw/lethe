@@ -11,6 +11,7 @@
 //! own client — that is the zero-egress invariant, structurally.
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -115,6 +116,8 @@ pub struct BlueskyAdapter {
     descriptor: Descriptor,
     /// Authenticated account. `None` until `authenticate` runs.
     did: Option<Did>,
+    /// Where a downloaded file waits, unencrypted, until the backup has it.
+    downloads: PathBuf,
 }
 
 impl BlueskyAdapter {
@@ -131,7 +134,20 @@ impl BlueskyAdapter {
                 lethe_adapter::Endpoint::host(pds_host.to_owned()),
             ],
         };
-        Self { agent: Arc::new(build_agent(&egress)), descriptor, did: None }
+        Self {
+            agent: Arc::new(build_agent(&egress)),
+            descriptor,
+            did: None,
+            downloads: std::env::temp_dir(),
+        }
+    }
+
+    /// Downloads files into `dir` instead of the system temp directory. A file sits
+    /// there unencrypted until the backup has it, and stays if the process dies
+    /// first, so `dir` should be one the caller empties on startup.
+    pub fn download_to(mut self, dir: PathBuf) -> Self {
+        self.downloads = dir;
+        self
     }
 
     /// Restore a stored session so `enumerate`/`fetch_media`/`delete` act as the account.
@@ -255,7 +271,7 @@ impl PlatformAdapter for BlueskyAdapter {
             ));
         }
 
-        let mut file = tempfile::NamedTempFile::new().map_err(io_error)?;
+        let mut file = tempfile::NamedTempFile::new_in(&self.downloads).map_err(io_error)?;
         file.write_all(&bytes).map_err(io_error)?;
         let path = file.into_temp_path().keep().map_err(|e| io_error(e.error))?;
         Ok(FetchedMedia { path, handle: 0 })
