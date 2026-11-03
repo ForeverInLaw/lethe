@@ -15,6 +15,10 @@ use parking_lot::Mutex;
 /// a stalled one fails instead of holding a run past its stop button.
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long opening a connection may take. A network that drops packets otherwise
+/// holds each attempt until the read timeout ends it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug, thiserror::Error)]
 pub enum EgressError {
     #[error("blocked: host '{0}' is not on the egress allowlist")]
@@ -41,13 +45,18 @@ pub struct Egress {
 
 impl Egress {
     pub fn new(allow: impl IntoIterator<Item = String>) -> Self {
-        Self::with_read_timeout(allow, READ_TIMEOUT)
+        Self::with_timeouts(allow, CONNECT_TIMEOUT, READ_TIMEOUT)
     }
 
-    fn with_read_timeout(allow: impl IntoIterator<Item = String>, read_timeout: Duration) -> Self {
+    fn with_timeouts(
+        allow: impl IntoIterator<Item = String>,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(concat!("lethe/", env!("CARGO_PKG_VERSION")))
             .use_rustls_tls()
+            .connect_timeout(connect_timeout)
             .read_timeout(read_timeout)
             .build()
             .expect("reqwest client");
@@ -122,8 +131,44 @@ mod tests {
         addr
     }
 
+    /// A listener that never accepts, with its queue full, so Linux drops new
+    /// connection attempts unanswered, as a network that loses packets does. It keeps
+    /// dropping them while it lives.
+    #[cfg(target_os = "linux")]
+    struct ServerDroppingNewConnections {
+        addr: std::net::SocketAddr,
+        _listener: tokio::net::TcpListener,
+        _queued: Vec<tokio::net::TcpStream>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ServerDroppingNewConnections {
+        async fn start() -> Self {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            let addr = socket.local_addr().unwrap();
+            let listener = socket.listen(0).unwrap();
+            // Loopback connects at once, and Linux resends a dropped SYN only after 1 s,
+            // so an attempt still waiting after 500 ms is one the full queue dropped.
+            let connect = || tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(addr));
+            let mut queued = Vec::new();
+            for _ in 0..64 {
+                match connect().await {
+                    Ok(Ok(stream)) => queued.push(stream),
+                    _ if queued.is_empty() => panic!("the first connection did not open"),
+                    _ => return Self { addr, _listener: listener, _queued: queued },
+                }
+            }
+            panic!("the listener's queue never filled");
+        }
+    }
+
+    fn local_egress(connect_timeout: Duration, read_timeout: Duration) -> Egress {
+        Egress::with_timeouts(["127.0.0.1".to_owned()], connect_timeout, read_timeout)
+    }
+
     fn impatient_egress() -> Egress {
-        Egress::with_read_timeout(["127.0.0.1".to_owned()], Duration::from_millis(100))
+        local_egress(Duration::from_millis(100), Duration::from_millis(100))
     }
 
     #[tokio::test]
@@ -153,6 +198,22 @@ mod tests {
         let outcome = tokio::time::timeout(Duration::from_secs(5), egress.execute(request)).await;
 
         assert!(outcome.expect("the request must not hang").is_err());
+    }
+
+    /// Linux only: Windows refuses a connection to a full queue instead of dropping it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_connection_that_cannot_be_opened_times_out() {
+        let server = ServerDroppingNewConnections::start().await;
+        // The read timeout ends a hanging connection attempt too, so it stays long:
+        // a short one would pass this test without a connect timeout.
+        let egress = local_egress(Duration::from_millis(100), READ_TIMEOUT);
+        let request = egress.client().get(format!("http://{}/", server.addr)).build().unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), egress.execute(request)).await;
+
+        let error = outcome.expect("the connection attempt must not hang").unwrap_err();
+        assert!(matches!(error, EgressError::Http(e) if e.is_connect() && e.is_timeout()));
     }
 
     #[tokio::test]
