@@ -1,6 +1,7 @@
 //! What a run does when an item's file does not reach the backup.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lethe_adapter::AdapterError;
 
@@ -89,6 +90,26 @@ async fn a_run_waiting_for_the_connection_can_be_stopped() {
     assert!(matches!(run.outcome, Err(EngineError::Aborted)));
     assert_eq!(run.store.unsaved_files("media", 10).unwrap().total, 0, "an outage is not the file's fault");
     assert!(!adapter.journal().contains(&"delete m".to_string()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_is_seen_while_the_connection_check_hangs() {
+    let control = RunControl::new();
+    let stop = control.clone();
+    let adapter = Arc::new(
+        MediaAdapter::new(vec![media_item("m", &[("photo", 3)])], |_, _| {
+            Err(AdapterError::Transport("no route to host".into()))
+        })
+        .with_stalled_connection_check(),
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        stop.stop();
+    });
+
+    let run = tokio::time::timeout(Duration::from_secs(600), run_media(adapter, control)).await;
+
+    assert!(matches!(run.expect("the stop must end the run").outcome, Err(EngineError::Aborted)));
 }
 
 #[tokio::test]

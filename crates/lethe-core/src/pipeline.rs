@@ -415,7 +415,7 @@ async fn fetch_file(
             continue;
         }
         // Out of retries: a platform that still answers points at this one file.
-        if adapter.is_reachable().await {
+        if reachable(adapter, control).await? {
             return Some(result);
         }
         if !wait_for_connection(adapter, control, progress).await {
@@ -433,10 +433,30 @@ async fn wait_for_connection(adapter: &dyn PlatformAdapter, control: &RunControl
         if !wait(CONNECTION_POLL, control).await {
             return false;
         }
-        if adapter.is_reachable().await {
-            let _ = progress.send(ProgressEvent::Online);
-            return true;
+        match reachable(adapter, control).await {
+            None => return false,
+            Some(true) => {
+                let _ = progress.send(ProgressEvent::Online);
+                return true;
+            }
+            Some(false) => {}
         }
+    }
+}
+
+/// Asks whether the platform answers, dropping the question once the run is stopped:
+/// a connection that stalls can hold it well past a stop. `None` once stopped.
+async fn reachable(adapter: &dyn PlatformAdapter, control: &RunControl) -> Option<bool> {
+    tokio::select! {
+        answer = adapter.is_reachable() => Some(answer),
+        () = stopped(control) => None,
+    }
+}
+
+/// Completes once the run has been stopped.
+async fn stopped(control: &RunControl) {
+    while !control.is_stopped() {
+        tokio::time::sleep(STOP_POLL).await;
     }
 }
 
@@ -833,6 +853,8 @@ mod tests {
         fetch: Box<dyn Fn(&MediaRef, usize) -> std::result::Result<FetchedMedia, AdapterError> + Send + Sync>,
         /// Whether the n-th connection check finds the platform.
         reachable: Box<dyn Fn(usize) -> bool + Send + Sync>,
+        /// A connection check never comes back.
+        check_stalls: bool,
         delete_rate_limits: AtomicUsize,
         fetches: AtomicUsize,
         checks: AtomicUsize,
@@ -849,6 +871,7 @@ mod tests {
                 items,
                 fetch: Box::new(fetch),
                 reachable: Box::new(|_| true),
+                check_stalls: false,
                 delete_rate_limits: AtomicUsize::new(0),
                 fetches: AtomicUsize::new(0),
                 checks: AtomicUsize::new(0),
@@ -858,6 +881,11 @@ mod tests {
 
         pub(super) fn with_connection(mut self, reachable: impl Fn(usize) -> bool + Send + Sync + 'static) -> Self {
             self.reachable = Box::new(reachable);
+            self
+        }
+
+        pub(super) fn with_stalled_connection_check(mut self) -> Self {
+            self.check_stalls = true;
             self
         }
 
@@ -905,6 +933,9 @@ mod tests {
 
         async fn is_reachable(&self) -> bool {
             self.note("check connection".into());
+            if self.check_stalls {
+                std::future::pending::<()>().await;
+            }
             (self.reachable)(self.checks.fetch_add(1, Ordering::SeqCst))
         }
 
