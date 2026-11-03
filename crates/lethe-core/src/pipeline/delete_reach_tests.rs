@@ -75,7 +75,6 @@ fn preview_request() -> RunRequest {
         account_label: "acc".into(),
         plan: EnumeratePlan::default(),
         filter: match_all_filter(),
-        backup: true,
         allow_incomplete_backup: false,
         allow_lost_files: false,
         allow_only_for_self: false,
