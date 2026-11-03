@@ -36,7 +36,7 @@ async fn starting_a_run_again_keeps_the_backup_it_already_wrote() {
     let again = Arc::new(MediaAdapter::new(vec![photo("m1"), photo("m2")], |_, _| Ok(downloaded(b"abc"))));
     let outcome = run.start_again(again.clone()).await;
 
-    assert!(matches!(outcome, Err(EngineError::Io(_))));
+    assert!(matches!(outcome, Err(EngineError::Io(message)) if message.contains("already exists")));
     assert_eq!(run.audit(), ArchiveAudit { items: 1, media_files: 1, complete: true });
     assert!(again.journal().iter().all(|entry| !entry.starts_with("delete")));
 }
