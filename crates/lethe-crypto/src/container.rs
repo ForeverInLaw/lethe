@@ -116,7 +116,9 @@ impl<W: Write> ContainerWriter<W> {
     }
 }
 
-fn read_frame_part<R: Read>(source: &mut R, buf: &mut [u8]) -> Result<()> {
+/// Running out of bytes anywhere before the FINAL frame, header included, means
+/// the stream was cut before it was sealed.
+fn read_or_cut_off<R: Read>(source: &mut R, buf: &mut [u8]) -> Result<()> {
     source.read_exact(buf).map_err(|e| match e.kind() {
         ErrorKind::UnexpectedEof => CryptoError::CutOff,
         _ => CryptoError::Io(e.to_string()),
@@ -133,17 +135,17 @@ pub struct ContainerReader<R: Read> {
 impl<R: Read> ContainerReader<R> {
     pub fn open(mut source: R, key: &DataKey) -> Result<Self> {
         let mut magic = [0u8; 4];
-        source.read_exact(&mut magic).map_err(|e| CryptoError::Io(e.to_string()))?;
+        read_or_cut_off(&mut source, &mut magic)?;
         if &magic != MAGIC {
             return Err(CryptoError::Open);
         }
         let mut ver = [0u8; 1];
-        source.read_exact(&mut ver).map_err(|e| CryptoError::Io(e.to_string()))?;
+        read_or_cut_off(&mut source, &mut ver)?;
         if ver[0] != VERSION {
             return Err(CryptoError::Open);
         }
         let mut header = [0u8; HEADER_LEN];
-        source.read_exact(&mut header).map_err(|e| CryptoError::Io(e.to_string()))?;
+        read_or_cut_off(&mut source, &mut header)?;
 
         let ds_key = Key::from(key);
         let ds_header = Header::from(&header);
@@ -162,7 +164,7 @@ impl<R: Read> ContainerReader<R> {
         let mut len_bytes = [0u8; 4];
         // A complete container always ends with a FINAL frame, so running out of
         // bytes here or inside the frame means the stream was cut before it was sealed.
-        read_frame_part(&mut self.source, &mut len_bytes)?;
+        read_or_cut_off(&mut self.source, &mut len_bytes)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
         // A damaged length can claim 4 GiB; no real frame comes near that.
@@ -171,7 +173,7 @@ impl<R: Read> ContainerReader<R> {
         }
 
         let mut ct = vec![0u8; len];
-        read_frame_part(&mut self.source, &mut ct)?;
+        read_or_cut_off(&mut self.source, &mut ct)?;
 
         let (plaintext, tag) =
             self.stream.pull_to_vec(&ct, None).map_err(|_| CryptoError::Open)?;

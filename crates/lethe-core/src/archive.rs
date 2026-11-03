@@ -427,6 +427,13 @@ mod tests {
     }
 
     #[test]
+    fn audit_reads_an_archive_cut_inside_its_header_as_cut_off() {
+        let mut buf = unsealed(&[b"{}"]);
+        buf.truncate(10);
+        assert_eq!(audit_archive(buf.as_slice(), &KEY).unwrap(), ArchiveAudit::default());
+    }
+
+    #[test]
     fn audit_still_rejects_a_damaged_archive_that_is_also_cut_off() {
         let mut buf = unsealed(&[b"{}", br#"{"media":[]}"#, br#"{"media":[]}"#]);
         let last = buf.len() - 1;
