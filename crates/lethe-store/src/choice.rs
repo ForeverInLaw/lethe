@@ -11,17 +11,22 @@ pub struct ChoiceCounts {
     pub kept: u64,
 }
 
+/// The states a row moves between when it is kept (`protected`) or let go again.
+pub(crate) fn protection_move(protected: bool) -> (ItemState, ItemState) {
+    if protected {
+        (ItemState::Pending, ItemState::Protected)
+    } else {
+        (ItemState::Protected, ItemState::Pending)
+    }
+}
+
 impl Store {
     /// Keeps, or lets go again, every row the filter covers, loaded on screen or
     /// not, in one statement. Returns how many rows changed. Like
     /// `set_item_protected`, it leaves rows that already ran, and changes nothing
     /// once the run executes.
     pub fn set_items_protected(&self, run_id: &str, filter: &ItemFilter, protected: bool) -> Result<u64> {
-        let (from, to) = if protected {
-            (ItemState::Pending, ItemState::Protected)
-        } else {
-            (ItemState::Protected, ItemState::Pending)
-        };
+        let (from, to) = protection_move(protected);
         let (run_id, content_type, needle, subtypes) = filter.params(run_id)?;
         let changed = self.conn.execute(
             &format!(

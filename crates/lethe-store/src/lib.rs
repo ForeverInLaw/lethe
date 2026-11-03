@@ -17,6 +17,7 @@ mod unsaved_files;
 pub use pending::{Consents, PendingConsents, PendingMedia};
 pub use scopes::{ScopeCount, ScopeOutcome};
 pub use choice::ChoiceCounts;
+use choice::protection_move;
 pub use filter::{ItemFilter, ItemGroup};
 pub use search::fold_yo_ye;
 pub use state::{FileFailure, ItemState, RunState};
@@ -332,11 +333,7 @@ impl Store {
         platform_id: &str,
         protected: bool,
     ) -> Result<bool> {
-        let (from, to) = if protected {
-            (ItemState::Pending, ItemState::Protected)
-        } else {
-            (ItemState::Protected, ItemState::Pending)
-        };
+        let (from, to) = protection_move(protected);
         let changed = self.conn.execute(
             "UPDATE items SET state = ?1
              WHERE run_id = ?2 AND platform_id = ?3 AND state = ?4
