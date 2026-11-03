@@ -133,13 +133,13 @@ pub async fn list_chat_scopes(
 
 /// Searches by sender, so a page holds only the user's messages regardless of how
 /// deep they sit in the history. Not supported by TDLib for secret chats.
-pub async fn search_own_messages(
+async fn search_own_page(
     client_id: TdlibClientId,
     chat_id: i64,
     current_user_id: i64,
     from_message_id: i64,
     limit: i32,
-) -> Result<OwnMessagePage, AdapterError> {
+) -> Result<types::FoundChatMessages, AdapterError> {
     let sender = enums::MessageSender::User(types::MessageSenderUser {
         user_id: current_user_id,
     });
@@ -156,8 +156,43 @@ pub async fn search_own_messages(
     )
     .await
     .map_err(map_tdlib_error)?;
-
     let enums::FoundChatMessages::FoundChatMessages(found) = found;
+    Ok(found)
+}
+
+/// The newest page of the user's messages in a chat, counted without reading what
+/// may be done with each, so counting a chat costs one search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnMessageTally {
+    /// The user's messages on the page.
+    pub found: usize,
+    /// TDLib's estimate across all pages; -1 if it does not know.
+    pub total_count: i32,
+}
+
+/// Counts the user's messages on the newest page of up to `limit` of them.
+pub async fn tally_own_messages(
+    client_id: TdlibClientId,
+    chat_id: i64,
+    current_user_id: i64,
+    limit: i32,
+) -> Result<OwnMessageTally, AdapterError> {
+    let found = search_own_page(client_id, chat_id, current_user_id, 0, limit).await?;
+    Ok(OwnMessageTally {
+        found: found.messages.iter().filter(|message| is_from_user(message, current_user_id)).count(),
+        total_count: found.total_count,
+    })
+}
+
+/// A page of the user's messages, each with what Telegram lets this account do with it.
+pub async fn search_own_messages(
+    client_id: TdlibClientId,
+    chat_id: i64,
+    current_user_id: i64,
+    from_message_id: i64,
+    limit: i32,
+) -> Result<OwnMessagePage, AdapterError> {
+    let found = search_own_page(client_id, chat_id, current_user_id, from_message_id, limit).await?;
     let mut messages = Vec::with_capacity(found.messages.len());
     for message in found.messages.iter().filter(|message| is_from_user(message, current_user_id)) {
         match read_delete_rights(client_id, chat_id, message.id).await {
