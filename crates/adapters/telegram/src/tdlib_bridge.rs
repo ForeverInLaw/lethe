@@ -412,8 +412,8 @@ fn message_subtype(message: &types::Message) -> Option<&'static str> {
     })
 }
 
-/// The words a message carries: its text, caption, or what it names, such as a
-/// poll's question or a new chat title.
+/// The words the user put in a message: its text, caption, or what it names, such
+/// as a poll's question or a new chat title. The keyword filter reads them too.
 fn extract_message_text(content: &enums::MessageContent) -> Option<String> {
     use enums::MessageContent::*;
     let text = match content {
@@ -430,7 +430,6 @@ fn extract_message_text(content: &enums::MessageContent) -> Option<String> {
         MessagePoll(poll) => &poll.poll.question.text,
         MessageChecklist(checklist) => &checklist.list.title.text,
         MessageVenue(venue) => &venue.venue.title,
-        MessageGame(game) => &game.game.title,
         MessageContact(contact) => {
             let name = format!("{} {}", contact.contact.first_name, contact.contact.last_name);
             let name = name.trim();
@@ -438,7 +437,6 @@ fn extract_message_text(content: &enums::MessageContent) -> Option<String> {
         }
         MessageChatChangeTitle(change) => &change.title,
         MessageForumTopicCreated(topic) => &topic.name,
-        MessageCustomServiceAction(action) => &action.text,
         _ => return None,
     };
     (!text.is_empty()).then(|| text.clone())
