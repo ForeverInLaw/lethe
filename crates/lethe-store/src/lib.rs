@@ -96,7 +96,7 @@ pub struct ItemRow {
     pub text: Option<String>,
     /// The name of its first named file.
     pub file_name: Option<String>,
-    /// Bytes of its files whose size is known; `None` when none is.
+    /// Bytes of its files; `None` unless every file's size is known.
     pub file_size: Option<u64>,
     /// `Pending`, `Protected` or `Undeletable`.
     pub state: ItemState,

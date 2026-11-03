@@ -1,9 +1,11 @@
-//! Finding preview rows by their text. SQLite folds case only for ASCII, so the
-//! comparison runs through a Rust function that folds Cyrillic as well.
+//! Finding preview rows by their text and file names. SQLite folds case only for
+//! ASCII, so the comparison runs through a Rust function that folds Cyrillic as well.
 
 use rusqlite::functions::FunctionFlags;
 use rusqlite::Connection;
 use unicode_normalization::UnicodeNormalization;
+
+use crate::file_facts;
 
 /// The SQL function that folds a row's text for `contains`.
 const FOLD: &str = "lethe_fold";
@@ -18,13 +20,15 @@ pub(crate) fn register(conn: &Connection) -> rusqlite::Result<()> {
     )
 }
 
-/// Rows whose text holds parameter `?{search}`, which `needle` gives, or whose
-/// subtype is in the JSON array `?{subtypes}`. Matches every row when the search
-/// is blank.
+/// Rows whose text or file name holds parameter `?{search}`, which `needle` gives,
+/// or whose subtype is in the JSON array `?{subtypes}`. Matches every row when the
+/// search is blank.
 pub(crate) fn matches(search: usize, subtypes: usize) -> String {
     format!(
         "(?{search} = '' OR instr({FOLD}(text), ?{search}) > 0
-          OR subtype IN (SELECT value FROM json_each(?{subtypes})))"
+          OR instr({FOLD}({}), ?{search}) > 0
+          OR subtype IN (SELECT value FROM json_each(?{subtypes})))",
+        file_facts::FILE_NAME
     )
 }
 
@@ -53,6 +57,8 @@ pub fn fold_yo_ye(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use lethe_adapter::MediaRef;
+
     use crate::tests::{run_with, snap};
     use crate::{ItemGroup, ItemQuery, ItemSnapshot, ItemState, Store};
 
@@ -95,6 +101,17 @@ mod tests {
         assert_eq!(found(&s, "ел"), ["spruce", "tree"]);
         assert_eq!(found(&s, "ЁЛ"), ["spruce", "tree"]);
         assert_eq!(found(&s, "ёж"), ["decomposed"]);
+    }
+
+    #[test]
+    fn preview_items_find_rows_by_their_file_name() {
+        let s = run_with(&[ItemSnapshot {
+            text: None,
+            media: vec![MediaRef { url: "u".into(), mime: None, file_name: Some("Отчёт.pdf".into()), size: None }],
+            ..snap("document", ItemState::Pending)
+        }]);
+
+        assert_eq!(found(&s, "отчет"), ["document"]);
     }
 
     #[test]
