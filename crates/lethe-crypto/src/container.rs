@@ -47,7 +47,9 @@ pub struct ContainerWriter<W: Write> {
     stream: DryocStream<Push>,
     /// Bytes in the sink up to the end of the last whole frame.
     written: u64,
-    /// A frame failed to reach the sink after it took the stream's next nonce.
+    /// A frame failed to reach the sink after it took the stream's next nonce. The
+    /// stream then takes no more chunks and cannot be sealed: picking up after the
+    /// lost frame would reuse its nonce.
     broken: bool,
 }
 
@@ -73,10 +75,10 @@ impl<W: Write> ContainerWriter<W> {
         self.written
     }
 
-    /// True once a write has failed. The stream then takes no more chunks and
-    /// cannot be sealed: picking up after the lost frame would reuse its nonce.
-    pub fn is_broken(&self) -> bool {
-        self.broken
+    /// Whether anything reached the sink since it held `start` bytes, a frame cut
+    /// short by a failed write included.
+    pub fn wrote_since(&self, start: u64) -> bool {
+        self.broken || self.written > start
     }
 
     pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
@@ -91,7 +93,8 @@ impl<W: Write> ContainerWriter<W> {
         self.sink.flush().map_err(|e| CryptoError::Io(e.to_string()))
     }
 
-    /// dryoc's `Bytes` bound is `Sized`, so the frame source must be owned.
+    /// Encrypts and writes one frame. A write that fails breaks the writer.
+    // dryoc's `Bytes` bound is `Sized`, so the frame source must be owned.
     fn push_frame(&mut self, msg: Vec<u8>, tag: Tag) -> Result<()> {
         if self.broken {
             return Err(CryptoError::Seal("an earlier write to the stream failed".into()));
@@ -320,7 +323,7 @@ mod tests {
         let whole = w.written();
         assert!(w.write_chunk(&[0u8; 300]).is_err());
 
-        assert!(w.is_broken());
+        assert!(w.wrote_since(whole));
         assert!(w.write_chunk(b"more").is_err());
         assert!(w.finish().is_err());
 

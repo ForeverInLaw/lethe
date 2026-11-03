@@ -119,9 +119,10 @@ impl ArchiveWriter {
         let start = self.container.written();
         let written = self.append_item(item, files, lost_reasons);
         if let Err(error) = &written {
-            if self.container.is_broken() || self.container.written() > start {
+            if self.container.wrote_since(start) {
                 self.cut_off = true;
-                if let Err(cut) = self.container.sink().set_len(start) {
+                let sink = self.container.sink();
+                if let Err(cut) = sink.set_len(start).and_then(|()| sink.sync_data()) {
                     tracing::warn!(%cut, "could not cut off an item that failed halfway: {error}");
                 }
             }
@@ -355,11 +356,12 @@ pub fn audit_archive<R: Read>(source: R, key: &DataKey) -> Result<ArchiveAudit> 
 fn walk_audit<R: Read>(source: R, key: &DataKey, audit: &mut ArchiveAudit) -> Result<()> {
     let (mut walk, _manifest) = ArchiveWalk::open(source, key)?;
     while let Some((record, _)) = walk.next_record()? {
-        audit.items += 1;
         for stored in record.media.iter().filter_map(|media| media.stored.as_ref()) {
             walk.copy_file(stored, &mut io::sink(), |_| ControlFlow::Continue(()))?;
             audit.media_files += 1;
         }
+        // Only now, so an item the archive breaks off in is not counted as intact.
+        audit.items += 1;
     }
     Ok(())
 }
@@ -417,7 +419,7 @@ mod tests {
         assert_eq!(
             audit_archive(buf.as_slice(), &KEY).unwrap(),
             ArchiveAudit {
-                items: 2,
+                items: 1,
                 media_files: 1,
                 complete: false,
             }
