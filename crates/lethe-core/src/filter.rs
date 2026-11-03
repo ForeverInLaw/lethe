@@ -4,9 +4,9 @@
 use std::collections::BTreeSet;
 
 use lethe_adapter::{ContentType, Item};
+use lethe_store::fold_yo_ye;
 use regex::{Regex, RegexBuilder};
 use time::OffsetDateTime;
-use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FilterError {
@@ -124,17 +124,6 @@ fn engagement_within(e: &lethe_adapter::Engagement, max: &EngagementMax) -> bool
         && ok(e.replies, max.replies)
         && ok(e.reposts, max.reposts)
         && ok(e.views, max.views)
-}
-
-/// NFC-normalize and fold ё/Ё → е/Е so Cyrillic searches match as users expect.
-fn fold_yo_ye(s: &str) -> String {
-    s.nfc()
-        .map(|c| match c {
-            'ё' => 'е',
-            'Ё' => 'Е',
-            other => other,
-        })
-        .collect()
 }
 
 #[cfg(test)]

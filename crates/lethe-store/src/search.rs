@@ -29,11 +29,20 @@ pub(crate) fn needle(search: &str) -> String {
     fold(search.trim())
 }
 
-/// Lower case, composed, with ё read as е, as the keyword filter reads it.
+/// Lower case, composed, with ё read as е.
 fn fold(text: &str) -> String {
+    fold_yo_ye(text).to_lowercase()
+}
+
+/// NFC-normalize and fold ё/Ё → е/Е so Cyrillic searches match as users expect.
+/// The keyword filter uses it too.
+pub fn fold_yo_ye(text: &str) -> String {
     text.nfc()
-        .flat_map(char::to_lowercase)
-        .map(|c| if c == 'ё' { 'е' } else { c })
+        .map(|c| match c {
+            'ё' => 'е',
+            'Ё' => 'Е',
+            other => other,
+        })
         .collect()
 }
 
