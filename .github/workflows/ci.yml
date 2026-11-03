@@ -15,7 +15,6 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
 jobs:
-  # One job so tests and the egress probe share a single compile and cache.
   ci:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -25,12 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Build CLI target
-        run: cargo build -p lethe-cli --locked
       - name: Test workspace
         run: cargo test --workspace --locked
       - name: Test Telegram bridge
         run: cargo test -p lethe-telegram --features tdlib-download --locked
-      - name: Run CLI egress probe in a network namespace
-        run: |
-          sudo unshare --net -- bash -c 'ip link set lo up && timeout 15s ./target/debug/lethe-cli --ci-egress-probe'

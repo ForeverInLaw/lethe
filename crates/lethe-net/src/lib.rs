@@ -2,9 +2,9 @@
 //!
 //! Every adapter routes network through one shared `Egress`. The allowlist is
 //! the union of active adapters' declared endpoints. The in-process host check
-//! here is *defense-in-depth* and the source of the trust-panel request log —
-//! the **authoritative** guarantee is the CI network sandbox (the build fails
-//! on any connection outside the allowlist).
+//! here is the only enforcement today and the source of the trust-panel request
+//! log. A CI network sandbox that fails the build on any connection outside the
+//! allowlist is planned, not built.
 
 use std::collections::HashSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -63,8 +63,8 @@ impl Egress {
     }
 
     /// Hand a shared client to an SDK that insists on its own (e.g. atrium's
-    /// `ReqwestClient`). Prefer `execute`; the CI sandbox enforces the allowlist
-    /// regardless. TODO(net): wrap in a host-enforcing tower middleware so the
+    /// `ReqwestClient`). Prefer `execute`: requests sent on this client skip the
+    /// allowlist check. TODO(net): wrap in a host-enforcing tower middleware so the
     /// in-process guarantee matches the sandbox.
     pub fn client(&self) -> reqwest::Client {
         self.client.clone()
@@ -124,6 +124,24 @@ mod tests {
 
     fn impatient_egress() -> Egress {
         Egress::with_read_timeout(["127.0.0.1".to_owned()], Duration::from_millis(100))
+    }
+
+    #[tokio::test]
+    async fn a_host_off_the_allowlist_is_logged_and_never_contacted() {
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let egress = Egress::new(["bsky.social".to_owned()]);
+        let request = egress.client().get(format!("http://{addr}/")).build().unwrap();
+
+        let outcome = egress.execute(request).await;
+
+        assert!(matches!(outcome, Err(EgressError::Blocked(host)) if host == "127.0.0.1"));
+        let log = egress.log();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].host, "127.0.0.1");
+        assert!(!log[0].allowed);
+        let contacted = tokio::time::timeout(Duration::from_millis(200), server.accept()).await;
+        assert!(contacted.is_err(), "a blocked request must not open a connection");
     }
 
     #[tokio::test]

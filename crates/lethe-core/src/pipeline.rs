@@ -32,7 +32,6 @@ pub struct RunRequest {
     pub account_label: String,
     pub plan: EnumeratePlan,
     pub filter: FilterSpec,
-    pub backup: bool,
     /// The person agreed to delete items the backup cannot hold in full. Without
     /// this, such items stay on the platform.
     pub allow_incomplete_backup: bool,
@@ -92,8 +91,8 @@ impl RunOutcome {
     }
 }
 
-/// Sign the run summary and persist the receipt. Shared by the CLI and the
-/// Tauri shell so receipt handling lives in exactly one place.
+/// Sign the run summary and persist the receipt, so receipt handling lives in the
+/// engine rather than in each shell.
 pub fn store_receipt(
     store: &Store,
     signer: &ReceiptSigner,
@@ -194,13 +193,10 @@ pub async fn execute(
     progress: &ProgressTx,
     backup: Option<BackupTarget>,
 ) -> Result<RunOutcome> {
-    // Open the encrypted backup up front (FR-BAK-1, on-by-default): if a target
-    // is given and the run requests backup, every item is archived BEFORE its
-    // delete, so an interrupted run never deletes anything it has not backed up.
-    let mut writer = match (&backup, req.backup) {
-        (Some(target), true) => Some(ArchiveWriter::create(target, req)?),
-        _ => None,
-    };
+    // Open the encrypted backup up front (FR-BAK-1): given a target,
+    // every item is archived BEFORE its delete, so an interrupted run never deletes
+    // anything it has not backed up. Without one, the run keeps no copy.
+    let mut writer = backup.as_ref().map(|target| ArchiveWriter::create(target, req)).transpose()?;
     let result = delete_backed_up(adapter, store, scheduler, req, &control, progress, writer.as_mut()).await;
 
     // Sealed however the run ended (emits the FINAL frame; truncation is now
@@ -626,7 +622,6 @@ mod tests {
             account_label: "acc".into(),
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
-            backup: true,
             allow_incomplete_backup: false,
             allow_lost_files: false,
             allow_only_for_self: false,
@@ -711,7 +706,6 @@ mod tests {
             account_label: "acc".into(),
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
-            backup: false,
             allow_incomplete_backup: false,
             allow_lost_files: false,
             allow_only_for_self: false,
@@ -767,7 +761,6 @@ mod tests {
             account_label: "acc".into(),
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
-            backup: false,
             allow_incomplete_backup: false,
             allow_lost_files: false,
             allow_only_for_self: false,
@@ -970,7 +963,6 @@ mod tests {
             account_label: "acc".into(),
             plan: EnumeratePlan::default(),
             filter: match_all_filter(),
-            backup: true,
             allow_incomplete_backup,
             allow_lost_files,
             allow_only_for_self,

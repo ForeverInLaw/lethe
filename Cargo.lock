@@ -1502,22 +1502,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lethe-cli"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "lethe-adapter",
- "lethe-bluesky",
- "lethe-core",
- "lethe-crypto",
- "lethe-net",
- "lethe-store",
- "reqwest",
- "tokio",
-]
-
-[[package]]
 name = "lethe-core"
 version = "0.0.0"
 dependencies = [
