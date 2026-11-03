@@ -73,7 +73,8 @@ already deleted still verifies. The one exception is a write that fails halfway 
 an item, on a full disk for one: the backup is then cut back to the last whole item and
 left unsealed, because sealing after the lost bytes would reuse their nonce.
 `audit_archive` reports such a backup as cut off, with what it holds up to the cut, and
-fails only on one that is damaged. `BlueskyAdapter::download_to` puts downloaded files,
+fails only on one that is damaged. A run never writes over a backup that already exists:
+`execute` refuses such a path before it deletes anything. `BlueskyAdapter::download_to` puts downloaded files,
 which are plaintext until archived, in a folder the caller can empty on startup.
 
 `lethe_core::archive::ArchiveExport` turns a backup back into a plain folder: readable

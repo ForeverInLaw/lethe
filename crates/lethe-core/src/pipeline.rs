@@ -181,7 +181,9 @@ pub async fn snapshot(
 }
 
 /// Phase 2: backup → delete → checkpoint, over the `pending` rows only.
-/// Idempotent + resumable: re-running skips rows already in a terminal state.
+/// Idempotent + resumable: re-running skips rows already in a terminal state. A
+/// backup target that already holds a file is refused before anything is deleted,
+/// so a run started again needs a new one.
 pub async fn execute(
     adapter: Arc<dyn PlatformAdapter>,
     store: &mut Store,
@@ -641,7 +643,7 @@ mod tests {
         assert_eq!(counts.pending, n as u64);
 
         // Phase 2: backup-then-delete.
-        let path = std::env::temp_dir().join("lethe_pipeline_vertical_test.bin");
+        let path = std::env::temp_dir().join(format!("lethe-vertical-{}", uuid::Uuid::new_v4()));
         let key: DataKey = [9u8; 32];
         let outcome = execute(
             adapter,
@@ -912,6 +914,7 @@ mod tests {
         pub(super) store: Store,
         events: Vec<ProgressEvent>,
         pub(super) archive: PathBuf,
+        req: RunRequest,
     }
 
     pub(super) const ARCHIVE_KEY: DataKey = [5u8; 32];
@@ -994,7 +997,7 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             events.push(event);
         }
-        MediaRun { outcome, store, events, archive }
+        MediaRun { outcome, store, events, archive, req }
     }
 
     impl Drop for MediaRun {
@@ -1004,6 +1007,15 @@ mod tests {
     }
 
     impl MediaRun {
+        /// Previews the same run again with `adapter`'s items and starts it into the
+        /// same backup.
+        pub(super) async fn start_again(&mut self, adapter: Arc<MediaAdapter>) -> Result<RunOutcome> {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            snapshot(adapter.clone(), &self.store, &self.req, &tx).await.unwrap();
+            let target = BackupTarget { path: self.archive.clone(), key: ARCHIVE_KEY };
+            execute(adapter, &mut self.store, &mut Scheduler::new(), &self.req, RunControl::new(), &tx, Some(target)).await
+        }
+
         pub(super) fn audit(&self) -> crate::archive::ArchiveAudit {
             audit_archive(File::open(&self.archive).unwrap(), &ARCHIVE_KEY).unwrap()
         }
