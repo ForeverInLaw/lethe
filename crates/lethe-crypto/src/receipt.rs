@@ -116,6 +116,10 @@ pub fn verify(receipt: &SignedReceipt) -> Result<()> {
 }
 
 fn verify_detached(message: &[u8], public_key_hex: &str, signature_hex: &str) -> Result<()> {
+    // Checked before decoding, so a handed-over file cannot make it decode megabytes.
+    if public_key_hex.len() != PUBLIC_KEY_LEN * 2 || signature_hex.len() != SIGNATURE_LEN * 2 {
+        return Err(CryptoError::BadSignature);
+    }
     let pk_bytes = from_hex(public_key_hex).ok_or(CryptoError::BadSignature)?;
     let sig_bytes = from_hex(signature_hex).ok_or(CryptoError::BadSignature)?;
     let public_key: [u8; PUBLIC_KEY_LEN] =

@@ -36,6 +36,7 @@ import json, sys
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 receipt = json.load(open(sys.argv[1], encoding="utf-8"))
+assert (receipt["format"], receipt["algorithm"]) == ("lethe-receipt/1", "ed25519"), "unknown layout"
 key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(receipt["public_key_hex"]))
 key.verify(bytes.fromhex(receipt["signature_hex"]), receipt["summary"].encode("utf-8"))
 print(json.loads(receipt["summary"]))  # reached only when the signature holds
