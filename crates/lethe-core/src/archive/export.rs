@@ -343,9 +343,8 @@ fn claim_name<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{archive, KEY};
+    use super::super::tests::{archive, unsealed, KEY};
     use super::*;
-    use lethe_crypto::container::ContainerWriter;
 
     /// A throwaway folder the export writes into.
     struct Scratch(std::path::PathBuf);
@@ -371,16 +370,6 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
-    }
-
-    fn unsealed(chunks: &[&[u8]]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        let mut writer = ContainerWriter::create(&mut buf, &KEY).unwrap();
-        for chunk in chunks {
-            writer.write_chunk(chunk).unwrap();
-        }
-        drop(writer);
-        buf
     }
 
     fn export(scratch: &Scratch, buf: &[u8]) -> ExportReport {

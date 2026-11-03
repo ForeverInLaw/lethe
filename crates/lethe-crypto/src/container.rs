@@ -7,10 +7,10 @@
 //! then, per chunk:  ciphertext_len u32-LE | ciphertext
 //! ```
 //! The final frame carries the secretstream `FINAL` tag, so truncation is
-//! detected: a reader that hits EOF before `FINAL` returns an auth error, not a
-//! clean end.
+//! detected: a reader that hits EOF before `FINAL` returns `CutOff`, not a clean
+//! end. A frame that fails authentication is damage, and returns `Open`.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 use dryoc::dryocstream::{DryocStream, Header, Key, Pull, Push, Tag};
 use dryoc::types::Bytes;
@@ -34,17 +34,21 @@ pub fn derive_data_key(passphrase: &str, salt: &[u8]) -> Result<DataKey> {
     Ok(key)
 }
 
-fn write_frame<W: Write>(sink: &mut W, ciphertext: &[u8]) -> Result<()> {
+fn write_frame<W: Write>(sink: &mut W, ciphertext: &[u8]) -> Result<u64> {
     let len = ciphertext.len() as u32;
     sink.write_all(&len.to_le_bytes()).map_err(|e| CryptoError::Io(e.to_string()))?;
     sink.write_all(ciphertext).map_err(|e| CryptoError::Io(e.to_string()))?;
-    Ok(())
+    Ok(4 + u64::from(len))
 }
 
 /// Writes chunks as secretstream MESSAGE frames; `finish` emits the FINAL frame.
 pub struct ContainerWriter<W: Write> {
     sink: W,
     stream: DryocStream<Push>,
+    /// Bytes in the sink up to the end of the last whole frame.
+    written: u64,
+    /// A frame failed to reach the sink after it took the stream's next nonce.
+    broken: bool,
 }
 
 impl<W: Write> ContainerWriter<W> {
@@ -55,35 +59,65 @@ impl<W: Write> ContainerWriter<W> {
         sink.write_all(MAGIC).map_err(|e| CryptoError::Io(e.to_string()))?;
         sink.write_all(&[VERSION]).map_err(|e| CryptoError::Io(e.to_string()))?;
         sink.write_all(header.as_slice()).map_err(|e| CryptoError::Io(e.to_string()))?;
-        Ok(Self { sink, stream })
+        let written = (MAGIC.len() + 1 + HEADER_LEN) as u64;
+        Ok(Self { sink, stream, written, broken: false })
     }
 
     pub fn sink(&self) -> &W {
         &self.sink
     }
 
+    /// Bytes in the sink up to the end of the last whole frame: cut there, the
+    /// stream reads whole up to that point and then as cut off.
+    pub fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// True once a write has failed. The stream then takes no more chunks and
+    /// cannot be sealed: picking up after the lost frame would reuse its nonce.
+    pub fn is_broken(&self) -> bool {
+        self.broken
+    }
+
     pub fn write_chunk(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_CHUNK_BYTES {
             return Err(CryptoError::Seal("chunk is too large".into()));
         }
-        // dryoc's `Bytes` bound is `Sized`, so the frame source must be owned.
-        let msg = bytes.to_vec();
-        let ct = self
-            .stream
-            .push_to_vec(&msg, None, Tag::MESSAGE)
-            .map_err(|e| CryptoError::Seal(e.to_string()))?;
-        write_frame(&mut self.sink, &ct)
+        self.push_frame(bytes.to_vec(), Tag::MESSAGE)
     }
 
     pub fn finish(mut self) -> Result<()> {
-        let empty: Vec<u8> = Vec::new();
-        let ct = self
-            .stream
-            .push_to_vec(&empty, None, Tag::FINAL)
-            .map_err(|e| CryptoError::Seal(e.to_string()))?;
-        write_frame(&mut self.sink, &ct)?;
+        self.push_frame(Vec::new(), Tag::FINAL)?;
         self.sink.flush().map_err(|e| CryptoError::Io(e.to_string()))
     }
+
+    /// dryoc's `Bytes` bound is `Sized`, so the frame source must be owned.
+    fn push_frame(&mut self, msg: Vec<u8>, tag: Tag) -> Result<()> {
+        if self.broken {
+            return Err(CryptoError::Seal("an earlier write to the stream failed".into()));
+        }
+        let ct = self
+            .stream
+            .push_to_vec(&msg, None, tag)
+            .map_err(|e| CryptoError::Seal(e.to_string()))?;
+        match write_frame(&mut self.sink, &ct) {
+            Ok(len) => {
+                self.written += len;
+                Ok(())
+            }
+            Err(error) => {
+                self.broken = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn read_frame_part<R: Read>(source: &mut R, buf: &mut [u8]) -> Result<()> {
+    source.read_exact(buf).map_err(|e| match e.kind() {
+        ErrorKind::UnexpectedEof => CryptoError::CutOff,
+        _ => CryptoError::Io(e.to_string()),
+    })
 }
 
 /// Pull side. `read_chunk` returns `None` at the FINAL frame.
@@ -123,9 +157,9 @@ impl<R: Read> ContainerReader<R> {
             return Ok(None);
         }
         let mut len_bytes = [0u8; 4];
-        // A complete container always ends with a FINAL frame, so a clean EOF
-        // here means the stream was truncated before it was sealed.
-        self.source.read_exact(&mut len_bytes).map_err(|_| CryptoError::Open)?;
+        // A complete container always ends with a FINAL frame, so running out of
+        // bytes here or inside the frame means the stream was cut before it was sealed.
+        read_frame_part(&mut self.source, &mut len_bytes)?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
         // A damaged length can claim 4 GiB; no real frame comes near that.
@@ -134,7 +168,7 @@ impl<R: Read> ContainerReader<R> {
         }
 
         let mut ct = vec![0u8; len];
-        self.source.read_exact(&mut ct).map_err(|_| CryptoError::Open)?;
+        read_frame_part(&mut self.source, &mut ct)?;
 
         let (plaintext, tag) =
             self.stream.pull_to_vec(&ct, None).map_err(|_| CryptoError::Open)?;
@@ -236,6 +270,63 @@ mod tests {
         // report a clean end (no FINAL seen).
         buf.truncate(4 + 1 + HEADER_LEN);
         let mut r = ContainerReader::open(buf.as_slice(), &k).unwrap();
-        assert!(matches!(r.read_chunk(), Err(CryptoError::Open)));
+        assert!(matches!(r.read_chunk(), Err(CryptoError::CutOff)));
+    }
+
+    #[test]
+    fn a_stream_cut_inside_a_frame_reads_as_cut_off_after_its_whole_chunks() {
+        let k = key();
+        let mut buf = Vec::new();
+        let mut w = ContainerWriter::create(&mut buf, &k).unwrap();
+        w.write_chunk(b"first").unwrap();
+        w.write_chunk(b"second").unwrap();
+        w.finish().unwrap();
+
+        let first_frame_end = MAGIC.len() + 1 + HEADER_LEN + 4 + b"first".len() + AUTH_BYTES;
+        buf.truncate(first_frame_end + 6);
+        let mut r = ContainerReader::open(buf.as_slice(), &k).unwrap();
+        assert_eq!(r.read_chunk().unwrap().as_deref(), Some(&b"first"[..]));
+        assert!(matches!(r.read_chunk(), Err(CryptoError::CutOff)));
+    }
+
+    /// A disk that takes `room` more bytes and then reports itself full.
+    struct FillingDisk {
+        bytes: Vec<u8>,
+        room: usize,
+    }
+
+    impl Write for FillingDisk {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.room == 0 {
+                return Err(std::io::ErrorKind::StorageFull.into());
+            }
+            let n = buf.len().min(self.room);
+            self.bytes.extend_from_slice(&buf[..n]);
+            self.room -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_that_fails_halfway_breaks_the_stream_but_keeps_what_came_before() {
+        let k = key();
+        let mut disk = FillingDisk { bytes: Vec::new(), room: 200 };
+        let mut w = ContainerWriter::create(&mut disk, &k).unwrap();
+        w.write_chunk(b"kept").unwrap();
+        let whole = w.written();
+        assert!(w.write_chunk(&[0u8; 300]).is_err());
+
+        assert!(w.is_broken());
+        assert!(w.write_chunk(b"more").is_err());
+        assert!(w.finish().is_err());
+
+        disk.bytes.truncate(whole as usize);
+        let mut r = ContainerReader::open(disk.bytes.as_slice(), &k).unwrap();
+        assert_eq!(r.read_chunk().unwrap().as_deref(), Some(&b"kept"[..]));
+        assert!(matches!(r.read_chunk(), Err(CryptoError::CutOff)));
     }
 }

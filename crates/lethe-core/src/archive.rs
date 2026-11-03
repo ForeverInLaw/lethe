@@ -17,7 +17,7 @@ use std::ops::ControlFlow;
 
 use lethe_adapter::{FetchedMedia, MediaRef, PlatformRecord};
 use lethe_crypto::container::{ContainerReader, ContainerWriter};
-use lethe_crypto::DataKey;
+use lethe_crypto::{CryptoError, DataKey};
 use lethe_store::PendingItem;
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,8 @@ fn io_error(error: std::io::Error) -> EngineError {
 
 pub(crate) struct ArchiveWriter {
     container: ContainerWriter<File>,
+    /// An item failed halfway and was cut back off, so the archive ends unsealed.
+    cut_off: bool,
 }
 
 impl ArchiveWriter {
@@ -98,12 +100,36 @@ impl ArchiveWriter {
             platform: &req.platform,
             account_label: &req.account_label,
         })?)?;
-        Ok(Self { container })
+        Ok(Self { container, cut_off: false })
     }
 
     /// Appends one item and its files. `files` lines up with `item.media`; `None` is
     /// a file that could not be saved, and `lost_reasons` says why.
+    ///
+    /// An item that fails after part of it reached the file, on a full disk for one,
+    /// is cut back off. Sealing after it would need the nonces its frames already
+    /// used, so the archive then ends unsealed, after the last whole item: a reader
+    /// sees it as cut off rather than damaged.
     pub(crate) fn write_item(
+        &mut self,
+        item: &PendingItem,
+        files: &[Option<FetchedMedia>],
+        lost_reasons: &[String],
+    ) -> Result<()> {
+        let start = self.container.written();
+        let written = self.append_item(item, files, lost_reasons);
+        if let Err(error) = &written {
+            if self.container.is_broken() || self.container.written() > start {
+                self.cut_off = true;
+                if let Err(cut) = self.container.sink().set_len(start) {
+                    tracing::warn!(%cut, "could not cut off an item that failed halfway: {error}");
+                }
+            }
+        }
+        written
+    }
+
+    fn append_item(
         &mut self,
         item: &PendingItem,
         files: &[Option<FetchedMedia>],
@@ -170,17 +196,26 @@ impl ArchiveWriter {
         self.container.sink().sync_data().map_err(io_error)
     }
 
-    /// Emits the FINAL frame; truncation is detectable from here on.
+    /// Emits the FINAL frame; truncation is detectable from here on. Fails, and
+    /// leaves the archive unsealed, after an item was cut off.
     pub(crate) fn finish(self) -> Result<()> {
+        if self.cut_off {
+            return Err(EngineError::Io(
+                "the backup ends unsealed after the last item written in full".into(),
+            ));
+        }
         Ok(self.container.finish()?)
     }
 }
 
-/// What a complete, intact archive holds.
+/// What an intact archive holds.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ArchiveAudit {
     pub items: u64,
     pub media_files: u64,
+    /// False when the archive stops before it was sealed, as after a crash. What
+    /// it holds up to there is intact and counted; anything after is missing.
+    pub complete: bool,
 }
 
 /// An item record as a reader sees it. Every field is optional, because archives
@@ -306,10 +341,19 @@ impl<R: Read> ArchiveWalk<R> {
 }
 
 /// Decrypts the whole archive and checks that every file its records announce is
-/// there in full. Fails on a wrong key, tampering, truncation or a broken layout.
+/// there in full. Fails on a wrong key, tampering or a broken layout. An archive
+/// that just stops comes back incomplete, with what it holds up to there.
 pub fn audit_archive<R: Read>(source: R, key: &DataKey) -> Result<ArchiveAudit> {
-    let (mut walk, _manifest) = ArchiveWalk::open(source, key)?;
     let mut audit = ArchiveAudit::default();
+    match walk_audit(source, key, &mut audit) {
+        Ok(()) => Ok(ArchiveAudit { complete: true, ..audit }),
+        Err(EngineError::Crypto(CryptoError::CutOff)) => Ok(audit),
+        Err(error) => Err(error),
+    }
+}
+
+fn walk_audit<R: Read>(source: R, key: &DataKey, audit: &mut ArchiveAudit) -> Result<()> {
+    let (mut walk, _manifest) = ArchiveWalk::open(source, key)?;
     while let Some((record, _)) = walk.next_record()? {
         audit.items += 1;
         for stored in record.media.iter().filter_map(|media| media.stored.as_ref()) {
@@ -317,7 +361,7 @@ pub fn audit_archive<R: Read>(source: R, key: &DataKey) -> Result<ArchiveAudit> 
             audit.media_files += 1;
         }
     }
-    Ok(audit)
+    Ok(())
 }
 
 fn corrupt(reason: &str) -> EngineError {
@@ -350,6 +394,44 @@ mod tests {
         buf
     }
 
+    /// An archive whose writer stopped before sealing it, as after a crash.
+    pub(super) fn unsealed(chunks: &[&[u8]]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut writer = ContainerWriter::create(&mut buf, &KEY).unwrap();
+        for chunk in chunks {
+            writer.write_chunk(chunk).unwrap();
+        }
+        drop(writer);
+        buf
+    }
+
+    #[test]
+    fn audit_counts_what_a_cut_off_archive_holds_up_to_the_cut() {
+        let buf = unsealed(&[
+            b"{}",
+            br#"{"media":[{"archived_bytes":3,"chunks":1}]}"#,
+            b"abc",
+            br#"{"media":[{"archived_bytes":5,"chunks":2}]}"#,
+            b"abc",
+        ]);
+        assert_eq!(
+            audit_archive(buf.as_slice(), &KEY).unwrap(),
+            ArchiveAudit {
+                items: 2,
+                media_files: 1,
+                complete: false,
+            }
+        );
+    }
+
+    #[test]
+    fn audit_still_rejects_a_damaged_archive_that_is_also_cut_off() {
+        let mut buf = unsealed(&[b"{}", br#"{"media":[]}"#, br#"{"media":[]}"#]);
+        let last = buf.len() - 1;
+        buf[last] ^= 0x01;
+        assert!(audit_archive(buf.as_slice(), &KEY).is_err());
+    }
+
     #[test]
     fn audit_counts_items_and_files_of_an_intact_archive() {
         let buf = archive(&[
@@ -363,7 +445,8 @@ mod tests {
             audit_archive(buf.as_slice(), &KEY).unwrap(),
             ArchiveAudit {
                 items: 2,
-                media_files: 1
+                media_files: 1,
+                complete: true,
             }
         );
     }
@@ -378,7 +461,8 @@ mod tests {
             audit_archive(buf.as_slice(), &KEY).unwrap(),
             ArchiveAudit {
                 items: 1,
-                media_files: 0
+                media_files: 0,
+                complete: true,
             }
         );
     }

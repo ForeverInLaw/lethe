@@ -20,6 +20,10 @@ pub enum CryptoError {
     Seal(String),
     #[error("decryption/authentication failed")]
     Open,
+    /// The stream stops before its FINAL frame: every chunk read so far is authentic,
+    /// but whatever came after is missing.
+    #[error("the stream ends before it was sealed")]
+    CutOff,
     #[error("signature verification failed")]
     BadSignature,
     #[error("io: {0}")]
