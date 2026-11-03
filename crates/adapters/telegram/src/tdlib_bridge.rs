@@ -35,33 +35,11 @@ pub enum TelegramChatKind {
     Secret,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TelegramCleanability {
-    DeleteForEveryone,
-    OnlyForSelf,
-    NotCleanable,
-}
-
-impl TelegramCleanability {
-    fn from_flags(can_delete_for_all_users: bool, can_delete_only_for_self: bool) -> Self {
-        if can_delete_for_all_users {
-            Self::DeleteForEveryone
-        } else if can_delete_only_for_self {
-            Self::OnlyForSelf
-        } else {
-            Self::NotCleanable
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramChatScope {
     pub id: i64,
     pub title: String,
     pub kind: TelegramChatKind,
-    pub can_delete_for_all_users: bool,
-    pub can_delete_only_for_self: bool,
-    pub cleanability: TelegramCleanability,
     /// Changes whenever the chat gets a new message, so a count taken while it was
     /// the same still holds. None when TDLib does not know the last message.
     pub last_message_id: Option<i64>,
@@ -310,12 +288,6 @@ fn map_chat_scope(chat: &types::Chat) -> TelegramChatScope {
         id: chat.id,
         title: chat.title.clone(),
         kind: classify_chat_type(&chat.r#type),
-        can_delete_for_all_users: chat.can_be_deleted_for_all_users,
-        can_delete_only_for_self: chat.can_be_deleted_only_for_self,
-        cleanability: TelegramCleanability::from_flags(
-            chat.can_be_deleted_for_all_users,
-            chat.can_be_deleted_only_for_self,
-        ),
         last_message_id: chat.last_message.as_ref().map(|message| message.id),
     }
 }
@@ -579,22 +551,6 @@ mod tests {
 
         assert_eq!(classify_chat_type(&group), TelegramChatKind::Group);
         assert_eq!(classify_chat_type(&channel), TelegramChatKind::Channel);
-    }
-
-    #[test]
-    fn cleanability_prefers_delete_for_everyone() {
-        assert_eq!(
-            TelegramCleanability::from_flags(true, true),
-            TelegramCleanability::DeleteForEveryone
-        );
-        assert_eq!(
-            TelegramCleanability::from_flags(false, true),
-            TelegramCleanability::OnlyForSelf
-        );
-        assert_eq!(
-            TelegramCleanability::from_flags(false, false),
-            TelegramCleanability::NotCleanable
-        );
     }
 
     fn file(unique_id: &str, size: i64, expected_size: i64) -> types::File {

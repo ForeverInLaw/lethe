@@ -114,9 +114,9 @@ impl Store {
         let items = tx.execute(
             &format!(
                 "INSERT INTO items (run_id, platform_id, content_type, created_at, token, text, media_json,
-                                    platform_record, backup_gap, delete_reach, state)
+                                    platform_record, backup_gap, delete_reach, scope_id, state)
                  SELECT ?2, platform_id, content_type, created_at, token, text, media_json,
-                        platform_record, backup_gap, delete_reach, ?3
+                        platform_record, backup_gap, delete_reach, scope_id, ?3
                  FROM items WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE}"
             ),
             params![from_run_id, new_run_id, ItemState::Pending.as_str()],
@@ -202,6 +202,7 @@ mod tests {
                 platform_record: Some(PlatformRecord::from_json(format!("{{\"id\":\"{id}\"}}")).unwrap()),
                 backup_gap: Some("poll votes are missing".into()),
                 delete_reach: lethe_adapter::DeleteReach::Everyone,
+                scope_id: None,
                 state: ItemState::Pending,
             })
             .collect();

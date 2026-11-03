@@ -34,6 +34,22 @@ pub struct Consents {
     pub only_for_self: bool,
 }
 
+/// The waiting rows of run `?1` that go with the agreements `?2` (backup gaps)
+/// and `?3` (only for self).
+pub(crate) fn goes_with_consents() -> String {
+    format!(
+        "items.run_id = ?1 AND items.state = 'pending'
+         AND (?2 OR NOT ({BACKUP_GAP})) AND (?3 OR NOT ({ONLY_FOR_SELF}))"
+    )
+}
+
+impl Consents {
+    /// The parameters `goes_with_consents` takes.
+    pub(crate) fn params(self, run_id: &str) -> (&str, bool, bool) {
+        (run_id, self.backup_gaps, self.only_for_self)
+    }
+}
+
 impl Store {
     /// Files of the waiting rows that go with the agreements given.
     pub fn pending_media(&self, run_id: &str, consents: Consents) -> Result<PendingMedia> {
@@ -41,11 +57,10 @@ impl Store {
             "SELECT COALESCE(SUM(json_extract(file.value, '$.size')), 0),
                     COALESCE(MAX(json_extract(file.value, '$.size')), 0)
              FROM items, json_each(items.media_json) AS file
-             WHERE items.run_id = ?1 AND items.state = 'pending'
-               AND (?2 OR NOT ({BACKUP_GAP}))
-               AND (?3 OR NOT ({ONLY_FOR_SELF}))"
+             WHERE {}",
+            goes_with_consents()
         ))?;
-        let params = params![run_id, consents.backup_gaps, consents.only_for_self];
+        let params = consents.params(run_id);
         Ok(stmt.query_row(params, |r| {
             Ok(PendingMedia {
                 bytes: r.get::<_, i64>(0)? as u64,

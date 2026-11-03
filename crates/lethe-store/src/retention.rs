@@ -76,6 +76,7 @@ mod tests {
             platform_record: None,
             backup_gap: None,
             delete_reach: DeleteReach::Everyone,
+            scope_id: None,
             state,
         }
     }
