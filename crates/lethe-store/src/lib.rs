@@ -7,9 +7,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 mod pending;
 mod retention;
+mod scopes;
 mod state;
 mod unsaved_files;
 pub use pending::{Consents, PendingConsents, PendingMedia};
+pub use scopes::{ScopeCount, ScopeOutcome};
 pub use state::{FileFailure, ItemState, RunState};
 pub use unsaved_files::{FileRetryRun, UnsavedFiles, UnsavedItem};
 
@@ -34,6 +36,9 @@ pub struct ItemSnapshot {
     pub platform_record: Option<PlatformRecord>,
     pub backup_gap: Option<String>,
     pub delete_reach: DeleteReach,
+    /// Where the item sits on the platform, such as its chat. None where the
+    /// platform has no such place.
+    pub scope_id: Option<String>,
     /// `protected` when matched by the allow-list/pin predicate, `undeletable` when the
     /// platform will not delete it, else `pending`.
     pub state: ItemState,
@@ -213,8 +218,8 @@ impl Store {
             let mut stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO items
                  (run_id, platform_id, content_type, created_at, token, text, media_json,
-                  platform_record, backup_gap, delete_reach, state)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                  platform_record, backup_gap, delete_reach, scope_id, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             )?;
             for it in items {
                 let media_json = serde_json::to_string(&it.media)?;
@@ -229,6 +234,7 @@ impl Store {
                     it.platform_record.as_ref().map(PlatformRecord::as_json),
                     it.backup_gap,
                     state::reach_as_str(it.delete_reach),
+                    it.scope_id,
                     it.state.as_str(),
                 ])?;
             }
@@ -574,6 +580,9 @@ fn migrate_content_columns(conn: &Connection) -> Result<()> {
             [],
         )?;
     }
+    if !column_exists(conn, "items", "scope_id")? {
+        conn.execute("ALTER TABLE items ADD COLUMN scope_id TEXT", [])?;
+    }
     Ok(())
 }
 
@@ -610,6 +619,7 @@ mod tests {
             platform_record: None,
             backup_gap: None,
             delete_reach: DeleteReach::Everyone,
+            scope_id: None,
             state,
         }
     }

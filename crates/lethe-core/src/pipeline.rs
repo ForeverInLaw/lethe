@@ -156,6 +156,7 @@ pub async fn snapshot(
                 platform_record: item.platform_record.clone(),
                 backup_gap: item.backup_gap.clone(),
                 delete_reach: item.delete_reach,
+                scope_id: item.scope_id.clone(),
                 state,
             });
         }
@@ -479,6 +480,8 @@ mod delete_reach_tests;
 mod file_failure_tests;
 #[cfg(test)]
 mod sealing_tests;
+#[cfg(test)]
+mod scope_tests;
 
 #[cfg(test)]
 mod tests {
