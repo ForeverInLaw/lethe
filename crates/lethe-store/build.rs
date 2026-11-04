@@ -3,6 +3,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// OpenSSL's runtime library, newest major version first: Win64 OpenSSL 4 ships
+/// `libcrypto-4-x64.dll`, version 3 `libcrypto-3-x64.dll`.
+const LIBCRYPTO_DLLS: [&str; 2] = ["libcrypto-4-x64.dll", "libcrypto-3-x64.dll"];
+
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -13,7 +17,8 @@ fn main() {
 
     let Some(source) = find_libcrypto() else {
         println!(
-            "cargo:warning=libcrypto-3-x64.dll was not found; Windows test binaries may fail to launch unless OpenSSL bin is on PATH"
+            "cargo:warning=no OpenSSL runtime ({}) was found; Windows binaries may fail to launch unless OpenSSL bin is on PATH",
+            LIBCRYPTO_DLLS.join(" or ")
         );
         return;
     };
@@ -27,16 +32,16 @@ fn main() {
     copy_to(&source, &profile_dir.join("deps"));
 }
 
+/// Looks in the OpenSSL the build links against first, so the copied runtime matches it.
 fn find_libcrypto() -> Option<PathBuf> {
     candidate_dirs()
         .into_iter()
         .flat_map(|dir| {
-            [
-                dir.join("libcrypto-3-x64.dll"),
-                dir.join("bin").join("libcrypto-3-x64.dll"),
-                dir.join("..").join("bin").join("libcrypto-3-x64.dll"),
-            ]
+            LIBCRYPTO_DLLS.map(|dll| {
+                [dir.join(dll), dir.join("bin").join(dll), dir.join("..").join("bin").join(dll)]
+            })
         })
+        .flatten()
         .find(|path| path.is_file())
 }
 

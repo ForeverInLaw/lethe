@@ -41,6 +41,23 @@ Current verification baseline:
 - `cargo test --workspace`
 - `cargo test -p lethe-telegram --features tdlib-download`
 
+### Windows
+
+SQLCipher links the system OpenSSL on Windows. Install
+[Win64 OpenSSL](https://slproweb.com/products/Win32OpenSSL.html) (version 3 or 4, not
+the Light edition, which has no headers) and point the build at it in each PowerShell
+session:
+
+```
+$env:OPENSSL_DIR = "C:\Program Files\OpenSSL-Win64"
+$env:OPENSSL_INCLUDE_DIR = "$env:OPENSSL_DIR\include"
+$env:OPENSSL_LIB_DIR = "$env:OPENSSL_DIR\lib\VC\x64\MD"
+```
+
+`lethe-store`'s build script copies OpenSSL's runtime (`libcrypto-4-x64.dll` or
+`libcrypto-3-x64.dll`) next to the binaries it builds, so they start without OpenSSL on
+`PATH`. CI runs the store's tests on Windows.
+
 Telegram has passed live runs on a test group, including one with media files.
 Message text, media captions and media files go into the backup before the delete; a
 message whose file cannot be fetched stays where it is. The backup also keeps each

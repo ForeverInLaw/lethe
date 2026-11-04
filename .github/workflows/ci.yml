@@ -28,3 +28,29 @@ jobs:
         run: cargo test --workspace --locked
       - name: Test Telegram bridge
         run: cargo test -p lethe-telegram --features tdlib-download --locked
+  windows-store:
+    # SQLCipher links the system OpenSSL on Windows, and the store's build script copies
+    # its runtime next to the binaries so they start without OpenSSL on PATH.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+      - name: Install OpenSSL
+        run: choco install openssl --no-progress -y
+      - name: Test store
+        shell: pwsh
+        run: |
+          $ssl = "C:\Program Files\OpenSSL-Win64", "C:\Program Files\OpenSSL" |
+            Where-Object { Test-Path "$_\include\openssl" } | Select-Object -First 1
+          $lib = Get-ChildItem $ssl -Recurse -Filter libcrypto.lib |
+            Sort-Object { $_.FullName -notmatch 'x64\\MD' } | Select-Object -First 1
+          $env:OPENSSL_DIR = $ssl
+          $env:OPENSSL_INCLUDE_DIR = "$ssl\include"
+          $env:OPENSSL_LIB_DIR = $lib.DirectoryName
+          Get-ChildItem "$ssl\bin" -Filter 'libcrypto-*.dll' | ForEach-Object Name
+          cargo test -p lethe-store --locked
+          if (-not (Test-Path target\debug\deps\libcrypto-*-x64.dll)) { throw "the OpenSSL runtime was not copied next to the binaries" }
