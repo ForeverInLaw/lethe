@@ -44,13 +44,19 @@ jobs:
       - name: Test store
         shell: pwsh
         run: |
+          Get-ChildItem "C:\Program Files\OpenSSL*\bin" -Filter 'libcrypto-*.dll' | ForEach-Object FullName
           $ssl = "C:\Program Files\OpenSSL-Win64", "C:\Program Files\OpenSSL" |
             Where-Object { Test-Path "$_\include\openssl" } | Select-Object -First 1
+          if (-not $ssl) { throw "OpenSSL with headers was not found" }
           $lib = Get-ChildItem $ssl -Recurse -Filter libcrypto.lib |
             Sort-Object { $_.FullName -notmatch 'x64\\MD' } | Select-Object -First 1
+          if (-not $lib) { throw "libcrypto.lib was not found under $ssl" }
+          Write-Host "Linking OpenSSL from $ssl, $($lib.DirectoryName)"
           $env:OPENSSL_DIR = $ssl
           $env:OPENSSL_INCLUDE_DIR = "$ssl\include"
           $env:OPENSSL_LIB_DIR = $lib.DirectoryName
-          Get-ChildItem "$ssl\bin" -Filter 'libcrypto-*.dll' | ForEach-Object Name
           cargo test -p lethe-store --locked
-          if (-not (Test-Path target\debug\deps\libcrypto-*-x64.dll)) { throw "the OpenSSL runtime was not copied next to the binaries" }
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $copied = Get-ChildItem target\debug\deps -Filter 'libcrypto-*-x64.dll'
+          if (-not $copied) { throw "the OpenSSL runtime was not copied next to the binaries" }
+          Write-Host "Copied $($copied.Name)"

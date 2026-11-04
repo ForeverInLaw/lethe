@@ -217,6 +217,8 @@ mod tests {
         let store = Store::open(path, "k").unwrap();
         let (first, second) = (rows_of(&store, "first"), rows_of(&store, "second"));
         let gone = text_of(&store, "first", "gone");
+        // Windows cannot remove a database file that is still open.
+        drop(store);
         std::fs::remove_file(path).unwrap();
 
         assert_eq!(
