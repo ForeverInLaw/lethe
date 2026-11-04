@@ -23,6 +23,9 @@ fn main() {
         return;
     };
 
+    // An OpenSSL upgrade at the same path removes or replaces this file.
+    println!("cargo:rerun-if-changed={}", source.display());
+
     let Some(profile_dir) = cargo_profile_dir() else {
         println!("cargo:warning=Could not resolve Cargo profile dir for OpenSSL runtime copy");
         return;

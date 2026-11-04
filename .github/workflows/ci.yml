@@ -44,7 +44,6 @@ jobs:
       - name: Test store
         shell: pwsh
         run: |
-          Get-ChildItem "C:\Program Files\OpenSSL*\bin" -Filter 'libcrypto-*.dll' | ForEach-Object FullName
           $ssl = "C:\Program Files\OpenSSL-Win64", "C:\Program Files\OpenSSL" |
             Where-Object { Test-Path "$_\include\openssl" } | Select-Object -First 1
           if (-not $ssl) { throw "OpenSSL with headers was not found" }

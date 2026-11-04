@@ -56,7 +56,9 @@ $env:OPENSSL_LIB_DIR = "$env:OPENSSL_DIR\lib\VC\x64\MD"
 
 `lethe-store`'s build script copies OpenSSL's runtime (`libcrypto-4-x64.dll` or
 `libcrypto-3-x64.dll`) next to the binaries it builds, so they start without OpenSSL on
-`PATH`. CI runs the store's tests on Windows.
+`PATH`. CI runs the store's tests on Windows. `cargo test -p lethe-telegram --features
+tdlib-download` also needs `tdjson.dll`, which the build downloads into a `tdlib-rs-*`
+folder under `target\debug\build`, on `PATH`.
 
 Telegram has passed live runs on a test group, including one with media files.
 Message text, media captions and media files go into the backup before the delete; a
