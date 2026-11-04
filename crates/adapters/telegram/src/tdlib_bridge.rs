@@ -227,12 +227,17 @@ pub async fn tally_own_messages(
 ) -> Result<OwnMessageTally, AdapterError> {
     let page = search_own_page(client_id, chat_id, sender, 0, limit).await?;
     let found = page.messages.iter().filter(|message| is_sent_by(message, sender)).count();
-    // TDLib's estimate also counts the mirrored channel posts the page held.
-    let mirrored = page.messages.len() - found;
-    Ok(OwnMessageTally {
-        found,
-        total_count: if page.total_count < 0 { page.total_count } else { page.total_count - mirrored as i32 },
-    })
+    Ok(OwnMessageTally { found, total_count: estimate_sent(page.total_count, found, page.messages.len()) })
+}
+
+/// TDLib's estimate also counts channel posts mirrored into a discussion group, so it
+/// is scaled by the share of the page the sender wrote. -1 stays unknown.
+fn estimate_sent(total_count: i32, found: usize, page_len: usize) -> i32 {
+    if total_count < 0 || page_len == 0 {
+        return total_count;
+    }
+    let scaled = i64::from(total_count) * found as i64 / page_len as i64;
+    i32::try_from(scaled).unwrap_or(total_count)
 }
 
 /// A page of one sender's messages, each with what Telegram lets this account do with it.
@@ -806,6 +811,17 @@ mod tests {
         assert!(is_sent_by(&written, &chat(-100)));
         assert!(!is_sent_by(&mirrored, &chat(-100)));
         assert!(!is_sent_by(&written, &user(1)));
+    }
+
+    #[test]
+    fn the_estimate_keeps_the_share_of_the_page_the_sender_wrote() {
+        // A whole page held: the share makes it exact.
+        assert_eq!(estimate_sent(3, 3, 3), 3);
+        assert_eq!(estimate_sent(5, 2, 5), 2);
+        // A full page of 100 with 40 mirrored posts scales the estimate the same way.
+        assert_eq!(estimate_sent(1_000, 60, 100), 600);
+        assert_eq!(estimate_sent(-1, 60, 100), -1);
+        assert_eq!(estimate_sent(0, 0, 0), 0);
     }
 
     fn file(unique_id: &str, size: i64, expected_size: i64) -> types::File {
