@@ -44,6 +44,8 @@ pub struct TelegramChatScope {
     pub id: i64,
     pub title: String,
     pub kind: TelegramChatKind,
+    /// A channel the account created, whose posts are the account's own.
+    pub own_channel: bool,
     /// Changes whenever the chat gets a new message, so a count taken while it was
     /// the same still holds. None when TDLib does not know the last message.
     pub last_message_id: Option<i64>,
@@ -74,6 +76,45 @@ pub struct TelegramMessageRef {
     pub backup_gap: Option<String>,
     /// How far deleting this message goes, as Telegram says for this account.
     pub delete_reach: DeleteReach,
+}
+
+/// Who the account posts as: itself, and each channel it created, whose posts carry
+/// the channel's name instead of the person's.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnSenders {
+    pub user_id: i64,
+    pub channel_ids: Vec<i64>,
+}
+
+impl OwnSenders {
+    /// Whose messages in a chat are the account's: every post of a channel it created,
+    /// and in a supergroup what it sent as itself or as one of those channels.
+    fn in_chat(&self, chat_id: i64, chat_type: &enums::ChatType) -> Vec<enums::MessageSender> {
+        let channel = |chat_id| enums::MessageSender::Chat(types::MessageSenderChat { chat_id });
+        if self.channel_ids.contains(&chat_id) {
+            return vec![channel(chat_id)];
+        }
+        let user = enums::MessageSender::User(types::MessageSenderUser { user_id: self.user_id });
+        match chat_type {
+            enums::ChatType::Supergroup(supergroup) if !supergroup.is_channel => std::iter::once(user)
+                .chain(self.channel_ids.iter().copied().map(channel))
+                .collect(),
+            _ => vec![user],
+        }
+    }
+}
+
+/// The senders to search a chat for, one search each, so the account's messages are
+/// found whichever name they went out under.
+pub async fn own_senders_in(
+    client_id: TdlibClientId,
+    chat_id: i64,
+    own: &OwnSenders,
+) -> Result<Vec<enums::MessageSender>, AdapterError> {
+    let enums::Chat::Chat(chat) = functions::get_chat(chat_id, client_id.raw())
+        .await
+        .map_err(map_tdlib_error)?;
+    Ok(own.in_chat(chat_id, &chat.r#type))
 }
 
 /// One page of the user's own messages in a chat, newest first.
@@ -125,29 +166,36 @@ pub async fn list_chat_scopes(
             .await
             .map_err(map_tdlib_error)?;
         let enums::Chat::Chat(chat) = chat;
-        scopes.push(map_chat_scope(&chat));
+        let own_channel = match &chat.r#type {
+            enums::ChatType::Supergroup(supergroup) if supergroup.is_channel => {
+                let enums::Supergroup::Supergroup(supergroup) =
+                    functions::get_supergroup(supergroup.supergroup_id, client_id.raw())
+                        .await
+                        .map_err(map_tdlib_error)?;
+                matches!(supergroup.status, enums::ChatMemberStatus::Creator(_))
+            }
+            _ => false,
+        };
+        scopes.push(map_chat_scope(&chat, own_channel));
     }
 
     Ok(scopes)
 }
 
-/// Searches by sender, so a page holds only the user's messages regardless of how
+/// Searches by sender, so a page holds only that sender's messages regardless of how
 /// deep they sit in the history. Not supported by TDLib for secret chats.
 async fn search_own_page(
     client_id: TdlibClientId,
     chat_id: i64,
-    current_user_id: i64,
+    sender: &enums::MessageSender,
     from_message_id: i64,
     limit: i32,
 ) -> Result<types::FoundChatMessages, AdapterError> {
-    let sender = enums::MessageSender::User(types::MessageSenderUser {
-        user_id: current_user_id,
-    });
     let found = functions::search_chat_messages(
         chat_id,
         None,
         String::new(),
-        Some(sender),
+        Some(sender.clone()),
         from_message_id,
         0,
         limit,
@@ -160,41 +208,50 @@ async fn search_own_page(
     Ok(found)
 }
 
-/// The newest page of the user's messages in a chat, counted without reading what
+/// The newest page of one sender's messages in a chat, counted without reading what
 /// may be done with each, so counting a chat costs one search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnMessageTally {
-    /// The user's messages on the page.
+    /// The sender's messages on the page.
     pub found: usize,
     /// TDLib's estimate across all pages; -1 if it does not know.
     pub total_count: i32,
 }
 
-/// Counts the user's messages on the newest page of up to `limit` of them.
+/// Counts one sender's messages on the newest page of up to `limit` of them.
 pub async fn tally_own_messages(
     client_id: TdlibClientId,
     chat_id: i64,
-    current_user_id: i64,
+    sender: &enums::MessageSender,
     limit: i32,
 ) -> Result<OwnMessageTally, AdapterError> {
-    let found = search_own_page(client_id, chat_id, current_user_id, 0, limit).await?;
-    Ok(OwnMessageTally {
-        found: found.messages.iter().filter(|message| is_from_user(message, current_user_id)).count(),
-        total_count: found.total_count,
-    })
+    let page = search_own_page(client_id, chat_id, sender, 0, limit).await?;
+    let found = page.messages.iter().filter(|message| is_sent_by(message, sender)).count();
+    Ok(OwnMessageTally { found, total_count: estimate_sent(page.total_count, found, page.messages.len()) })
 }
 
-/// A page of the user's messages, each with what Telegram lets this account do with it.
+/// TDLib's estimate also counts channel posts mirrored into a discussion group, so it
+/// is scaled by the share of the page the sender wrote. -1 stays unknown.
+fn estimate_sent(total_count: i32, found: usize, page_len: usize) -> i32 {
+    if total_count < 0 || page_len == 0 {
+        return total_count;
+    }
+    let scaled = i64::from(total_count) * found as i64 / page_len as i64;
+    i32::try_from(scaled).unwrap_or(total_count)
+}
+
+/// A page of one sender's messages, each with what Telegram lets this account do with it.
 pub async fn search_own_messages(
     client_id: TdlibClientId,
     chat_id: i64,
+    sender: &enums::MessageSender,
     current_user_id: i64,
     from_message_id: i64,
     limit: i32,
 ) -> Result<OwnMessagePage, AdapterError> {
-    let found = search_own_page(client_id, chat_id, current_user_id, from_message_id, limit).await?;
+    let found = search_own_page(client_id, chat_id, sender, from_message_id, limit).await?;
     let mut messages = Vec::with_capacity(found.messages.len());
-    for message in found.messages.iter().filter(|message| is_from_user(message, current_user_id)) {
+    for message in found.messages.iter().filter(|message| is_sent_by(message, sender)) {
         match read_delete_rights(client_id, chat_id, message.id).await {
             Ok(rights) => messages.push(message_ref(message, rights.reach(chat_id, current_user_id))?),
             // Deleted since the search found it, so there is nothing left to clean.
@@ -339,11 +396,12 @@ pub async fn delete_message_batch(
         .map_err(map_tdlib_error)
 }
 
-fn map_chat_scope(chat: &types::Chat) -> TelegramChatScope {
+fn map_chat_scope(chat: &types::Chat, own_channel: bool) -> TelegramChatScope {
     TelegramChatScope {
         id: chat.id,
         title: chat.title.clone(),
         kind: classify_chat_type(&chat.r#type),
+        own_channel,
         last_message_id: chat.last_message.as_ref().map(|message| message.id),
     }
 }
@@ -358,6 +416,18 @@ fn classify_chat_type(chat_type: &enums::ChatType) -> TelegramChatKind {
         enums::ChatType::Supergroup(_) => TelegramChatKind::Group,
         enums::ChatType::Secret(_) => TelegramChatKind::Secret,
     }
+}
+
+/// Whether `sender` wrote the message here. A channel's posts are mirrored into its
+/// discussion group as forwards from the channel itself, which it did not send there.
+fn is_sent_by(message: &types::Message, sender: &enums::MessageSender) -> bool {
+    let mirrored = match (sender, message.forward_info.as_ref().map(|info| &info.origin)) {
+        (enums::MessageSender::Chat(channel), Some(enums::MessageOrigin::Channel(origin))) => {
+            origin.chat_id == channel.chat_id && message.chat_id != channel.chat_id
+        }
+        _ => false,
+    };
+    message.sender_id == *sender && !mirrored
 }
 
 fn is_from_user(message: &types::Message, current_user_id: i64) -> bool {
@@ -684,6 +754,74 @@ mod tests {
 
         assert_eq!(classify_chat_type(&group), TelegramChatKind::Group);
         assert_eq!(classify_chat_type(&channel), TelegramChatKind::Channel);
+    }
+
+    fn supergroup(is_channel: bool) -> enums::ChatType {
+        enums::ChatType::Supergroup(types::ChatTypeSupergroup { supergroup_id: 7, is_channel })
+    }
+
+    fn user(user_id: i64) -> enums::MessageSender {
+        enums::MessageSender::User(types::MessageSenderUser { user_id })
+    }
+
+    fn chat(chat_id: i64) -> enums::MessageSender {
+        enums::MessageSender::Chat(types::MessageSenderChat { chat_id })
+    }
+
+    #[test]
+    fn a_channel_the_account_created_is_searched_for_its_own_posts() {
+        let own = OwnSenders { user_id: 1, channel_ids: vec![-100, -200] };
+
+        assert_eq!(own.in_chat(-100, &supergroup(true)), vec![chat(-100)]);
+    }
+
+    #[test]
+    fn a_supergroup_is_searched_for_the_user_and_each_of_its_channels() {
+        let own = OwnSenders { user_id: 1, channel_ids: vec![-100, -200] };
+
+        assert_eq!(own.in_chat(-300, &supergroup(false)), vec![user(1), chat(-100), chat(-200)]);
+    }
+
+    #[test]
+    fn other_chats_are_searched_for_the_user_alone() {
+        let own = OwnSenders { user_id: 1, channel_ids: vec![-100] };
+        let private = enums::ChatType::Private(types::ChatTypePrivate { user_id: 2 });
+
+        assert_eq!(own.in_chat(2, &private), vec![user(1)]);
+        // Someone else's channel posts as itself, never as the account.
+        assert_eq!(own.in_chat(-400, &supergroup(true)), vec![user(1)]);
+    }
+
+    #[test]
+    fn a_channel_post_mirrored_into_its_discussion_group_is_not_sent_there() {
+        let mut written = message_with(enums::MessageContent::MessageUnsupported);
+        written.sender_id = chat(-100);
+        let mut mirrored = written.clone();
+        mirrored.forward_info = Some(types::MessageForwardInfo {
+            origin: enums::MessageOrigin::Channel(types::MessageOriginChannel {
+                chat_id: -100,
+                message_id: 5,
+                author_signature: String::new(),
+            }),
+            date: 0,
+            source: None,
+            public_service_announcement_type: String::new(),
+        });
+
+        assert!(is_sent_by(&written, &chat(-100)));
+        assert!(!is_sent_by(&mirrored, &chat(-100)));
+        assert!(!is_sent_by(&written, &user(1)));
+    }
+
+    #[test]
+    fn the_estimate_keeps_the_share_of_the_page_the_sender_wrote() {
+        // A whole page held: the share makes it exact.
+        assert_eq!(estimate_sent(3, 3, 3), 3);
+        assert_eq!(estimate_sent(5, 2, 5), 2);
+        // A full page of 100 with 40 mirrored posts scales the estimate the same way.
+        assert_eq!(estimate_sent(1_000, 60, 100), 600);
+        assert_eq!(estimate_sent(-1, 60, 100), -1);
+        assert_eq!(estimate_sent(0, 0, 0), 0);
     }
 
     fn file(unique_id: &str, size: i64, expected_size: i64) -> types::File {

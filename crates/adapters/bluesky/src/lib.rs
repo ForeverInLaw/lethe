@@ -10,11 +10,14 @@
 //! allowlist: `bsky.social` + the account PDS host. The adapter never builds its
 //! own client — that is the zero-egress invariant, structurally.
 
+use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
+use std::pin::pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::{self, BoxFuture, Either};
 use atrium_api::agent::Configure;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::agent::atp_agent::{AtpAgent, AtpSession};
@@ -129,6 +132,8 @@ pub struct BlueskyAdapter {
     did: Option<Did>,
     /// Where a downloaded file waits, unencrypted, until the backup has it.
     downloads: PathBuf,
+    /// Completes once the run is stopped, calling off a download in flight.
+    stop: Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
 }
 
 impl BlueskyAdapter {
@@ -150,7 +155,18 @@ impl BlueskyAdapter {
             descriptor,
             did: None,
             downloads: std::env::temp_dir(),
+            stop: Arc::new(|| Box::pin(future::pending())),
         }
+    }
+
+    /// Calls off a download once a future from `stop` completes, so stopping a run
+    /// does not wait for a large file to arrive. Without it a download runs to its end.
+    pub fn stopped_by<F>(mut self, stop: impl Fn() -> F + Send + Sync + 'static) -> Self
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.stop = Arc::new(move || Box::pin(stop()));
+        self
     }
 
     /// Downloads files into `dir` instead of the system temp directory. A file sits
@@ -267,15 +283,12 @@ impl PlatformAdapter for BlueskyAdapter {
         let did = self.did()?;
         let expected = cid.clone();
         let params = atrium_api::com::atproto::sync::get_blob::ParametersData { cid, did };
-        let bytes = self
-            .agent
-            .api
-            .com
-            .atproto
-            .sync
-            .get_blob(params.into())
-            .await
-            .map_err(map_blob_error)?;
+        let download = self.agent.api.com.atproto.sync.get_blob(params.into());
+        // Nothing is on disk until the whole file has arrived, so dropping it leaves nothing.
+        let bytes = match future::select(pin!(download), (self.stop)()).await {
+            Either::Left((bytes, _)) => bytes.map_err(map_blob_error)?,
+            Either::Right(((), _)) => return Err(AdapterError::Transport("the run was stopped".into())),
+        };
         if !is_content_of(&bytes, &expected) {
             return Err(AdapterError::Transport(
                 "the downloaded file does not match the post".into(),
@@ -765,6 +778,18 @@ mod tests {
 
             assert!(!matches!(error, AdapterError::FileRefused(_)), "{error}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_stopped_run_calls_off_a_download_in_flight() {
+        let slow = image_one_reply().set_delay(std::time::Duration::from_secs(30));
+        let (a, _pds) = adapter_on_pds(slow).await;
+        let a = a.stopped_by(|| tokio::time::sleep(std::time::Duration::from_millis(100)));
+
+        let fetched = tokio::time::timeout(std::time::Duration::from_secs(5), fetch_image_one(&a)).await;
+
+        let error = fetched.expect("the download outlived the stop").unwrap_err();
+        assert!(matches!(error, AdapterError::Transport(_)), "{error}");
     }
 
     #[tokio::test]
