@@ -225,10 +225,13 @@ pub async fn tally_own_messages(
     sender: &enums::MessageSender,
     limit: i32,
 ) -> Result<OwnMessageTally, AdapterError> {
-    let found = search_own_page(client_id, chat_id, sender, 0, limit).await?;
+    let page = search_own_page(client_id, chat_id, sender, 0, limit).await?;
+    let found = page.messages.iter().filter(|message| is_sent_by(message, sender)).count();
+    // TDLib's estimate also counts the mirrored channel posts the page held.
+    let mirrored = page.messages.len() - found;
     Ok(OwnMessageTally {
-        found: found.messages.iter().filter(|message| message.sender_id == *sender).count(),
-        total_count: found.total_count,
+        found,
+        total_count: if page.total_count < 0 { page.total_count } else { page.total_count - mirrored as i32 },
     })
 }
 
@@ -243,7 +246,7 @@ pub async fn search_own_messages(
 ) -> Result<OwnMessagePage, AdapterError> {
     let found = search_own_page(client_id, chat_id, sender, from_message_id, limit).await?;
     let mut messages = Vec::with_capacity(found.messages.len());
-    for message in found.messages.iter().filter(|message| message.sender_id == *sender) {
+    for message in found.messages.iter().filter(|message| is_sent_by(message, sender)) {
         match read_delete_rights(client_id, chat_id, message.id).await {
             Ok(rights) => messages.push(message_ref(message, rights.reach(chat_id, current_user_id))?),
             // Deleted since the search found it, so there is nothing left to clean.
@@ -408,6 +411,18 @@ fn classify_chat_type(chat_type: &enums::ChatType) -> TelegramChatKind {
         enums::ChatType::Supergroup(_) => TelegramChatKind::Group,
         enums::ChatType::Secret(_) => TelegramChatKind::Secret,
     }
+}
+
+/// Whether `sender` wrote the message here. A channel's posts are mirrored into its
+/// discussion group as forwards from the channel itself, which it did not send there.
+fn is_sent_by(message: &types::Message, sender: &enums::MessageSender) -> bool {
+    let mirrored = match (sender, message.forward_info.as_ref().map(|info| &info.origin)) {
+        (enums::MessageSender::Chat(channel), Some(enums::MessageOrigin::Channel(origin))) => {
+            origin.chat_id == channel.chat_id && message.chat_id != channel.chat_id
+        }
+        _ => false,
+    };
+    message.sender_id == *sender && !mirrored
 }
 
 fn is_from_user(message: &types::Message, current_user_id: i64) -> bool {
@@ -770,6 +785,27 @@ mod tests {
         assert_eq!(own.in_chat(2, &private), vec![user(1)]);
         // Someone else's channel posts as itself, never as the account.
         assert_eq!(own.in_chat(-400, &supergroup(true)), vec![user(1)]);
+    }
+
+    #[test]
+    fn a_channel_post_mirrored_into_its_discussion_group_is_not_sent_there() {
+        let mut written = message_with(enums::MessageContent::MessageUnsupported);
+        written.sender_id = chat(-100);
+        let mut mirrored = written.clone();
+        mirrored.forward_info = Some(types::MessageForwardInfo {
+            origin: enums::MessageOrigin::Channel(types::MessageOriginChannel {
+                chat_id: -100,
+                message_id: 5,
+                author_signature: String::new(),
+            }),
+            date: 0,
+            source: None,
+            public_service_announcement_type: String::new(),
+        });
+
+        assert!(is_sent_by(&written, &chat(-100)));
+        assert!(!is_sent_by(&mirrored, &chat(-100)));
+        assert!(!is_sent_by(&written, &user(1)));
     }
 
     fn file(unique_id: &str, size: i64, expected_size: i64) -> types::File {
