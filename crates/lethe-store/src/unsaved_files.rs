@@ -6,7 +6,7 @@
 use rusqlite::{params, Connection};
 
 use crate::state::{FileFailure, ItemState, RunState};
-use crate::{Result, Store};
+use crate::{file_facts, Result, Store};
 
 /// A row that stayed because its file did not reach the backup, so a retry still
 /// needs all of its content.
@@ -18,6 +18,8 @@ pub struct UnsavedItem {
     pub subtype: Option<String>,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
+    /// The name of its first named file.
+    pub file_name: Option<String>,
     pub failure: FileFailure,
 }
 
@@ -95,10 +97,11 @@ impl Store {
         // The order as a row value that only grows: undated after dated, newer
         // before older, then by id.
         let mut stmt = self.conn.prepare(&format!(
-            "SELECT platform_id, created_at, text, file_failure, subtype FROM items
+            "SELECT platform_id, created_at, text, file_failure, subtype, {} FROM items
              WHERE items.run_id = ?1 AND {WAITS_ON_A_FILE}
                AND (?3 IS NULL OR (created_at IS NULL, -IFNULL(created_at, 0), platform_id) > (?4, -?5, ?3))
-             ORDER BY created_at IS NULL, created_at DESC, platform_id LIMIT ?2"
+             ORDER BY created_at IS NULL, created_at DESC, platform_id LIMIT ?2",
+            file_facts::FILE_NAME
         ))?;
         let undated = after.map(|cursor| cursor.created_at_secs.is_none());
         let created_at = after.map(|cursor| cursor.created_at_secs.unwrap_or(0));
@@ -110,6 +113,7 @@ impl Store {
                     subtype: r.get(4)?,
                     created_at_secs: r.get(1)?,
                     text: r.get(2)?,
+                    file_name: r.get(5)?,
                     failure: FileFailure::from_stored(&r.get::<_, String>(3)?),
                 })
             })?
@@ -271,6 +275,7 @@ mod tests {
         assert_eq!(items[0].platform_id, "file");
         assert_eq!(items[0].failure, FileFailure::Unavailable);
         assert_eq!(items[0].text.as_deref(), Some("text of file"));
+        assert_eq!(items[0].file_name.as_deref(), Some("photo.jpg"));
         assert_eq!(items[1].failure, FileFailure::Unreachable);
     }
 

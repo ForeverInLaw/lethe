@@ -22,7 +22,7 @@ use atrium_api::agent::Configure;
 use atrium_api::agent::atp_agent::store::MemorySessionStore;
 use atrium_api::agent::atp_agent::{AtpAgent, AtpSession};
 use atrium_api::types::string::{AtIdentifier, Cid, Did, Nsid, RecordKey};
-use atrium_api::types::{BlobRef, TryFromUnknown, TypedBlobRef, Unknown};
+use atrium_api::types::{BlobRef, TryFromUnknown, TypedBlobRef};
 use atrium_xrpc_client::reqwest::ReqwestClientBuilder;
 use lethe_adapter::{
     AdapterError, AuthProvider, Capabilities, Consent, ContentType, Credential, DeleteReach, Descriptor,
@@ -385,15 +385,20 @@ fn record_to_item(
                 .created_at
                 .as_deref()
                 .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
-            (v.text, ts)
+            // A post with only an image still has a text field, left empty.
+            (v.text.filter(|text| !text.is_empty()), ts)
         }
         None => (None, None),
     };
 
-    let files = record_files(&rec.value)?;
+    // A post listed without its files would be deleted without them, so a record
+    // that cannot be read ends the scan.
+    let record = serde_json::to_value(&rec.value)
+        .map_err(|e| AdapterError::Platform(format!("unreadable record: {e}")))?;
+    let files = record_files(&record);
     Ok(Item {
         content_type,
-        subtype: None,
+        subtype: embed_subtype(&record["embed"]),
         created_at,
         text,
         engagement: Engagement::default(),
@@ -419,14 +424,23 @@ struct RecordFiles {
 
 /// Every blob a record owns, wherever it sits: images, a video and its captions,
 /// a link card's thumbnail, embed types added after this was written. A quoted
-/// post is only a reference, so its files are not picked up. A post listed without
-/// its files would be deleted without them, so failing to read a record ends the scan.
-fn record_files(record: &Unknown) -> Result<RecordFiles> {
-    let record = serde_json::to_value(record)
-        .map_err(|e| AdapterError::Platform(format!("unreadable record: {e}")))?;
+/// post is only a reference, so its files are not picked up.
+fn record_files(record: &serde_json::Value) -> RecordFiles {
     let mut files = RecordFiles::default();
-    collect_blobs(&record, &mut files);
-    Ok(files)
+    collect_blobs(record, &mut files);
+    files
+}
+
+/// What a post is, as Telegram would name it: a post with images is a photo, one
+/// with a video a video, including a quote that adds them. A link card or a bare
+/// quote leaves it a text post.
+fn embed_subtype(embed: &serde_json::Value) -> Option<&'static str> {
+    match embed.get("$type")?.as_str()? {
+        "app.bsky.embed.images" => Some("photo"),
+        "app.bsky.embed.video" => Some("video"),
+        "app.bsky.embed.recordWithMedia" => embed_subtype(&embed["media"]),
+        _ => None,
+    }
 }
 
 fn collect_blobs(value: &serde_json::Value, files: &mut RecordFiles) {
@@ -585,6 +599,42 @@ mod tests {
 
     fn media(cid: &str, mime: &str, size: Option<u64>) -> MediaRef {
         MediaRef { url: cid.into(), mime: Some(mime.into()), file_name: None, size }
+    }
+
+    #[test]
+    fn a_post_is_named_after_its_images_or_video() {
+        let images = json!({
+            "$type": "app.bsky.embed.images",
+            "images": [{ "alt": "", "image": blob(IMAGE_ONE, "image/jpeg", 100) }],
+        });
+        let video = json!({ "$type": "app.bsky.embed.video", "video": blob(VIDEO, "video/mp4", 300) });
+        let quote_with_images = json!({
+            "$type": "app.bsky.embed.recordWithMedia",
+            "record": { "$type": "app.bsky.embed.record", "record": { "uri": POST, "cid": IMAGE_TWO } },
+            "media": images.clone(),
+        });
+        let link = json!({
+            "$type": "app.bsky.embed.external",
+            "external": { "uri": "https://example.com", "title": "t", "description": "d" },
+        });
+
+        let named = [images, video, quote_with_images, link].map(|embed| item_of(embed).subtype);
+
+        // A link card or a bare quote is text with an extra, not a media post.
+        assert_eq!(named, [Some("photo"), Some("video"), Some("photo"), None]);
+        assert!(named.iter().flatten().all(|key| lethe_adapter::ITEM_SUBTYPES.contains(key)));
+    }
+
+    #[test]
+    fn a_post_with_only_an_image_has_no_text() {
+        let record = serde_json::from_value(json!({
+            "uri": POST,
+            "cid": IMAGE_ONE,
+            "value": { "$type": "app.bsky.feed.post", "text": "", "createdAt": "2026-01-01T00:00:00.000Z" },
+        }))
+        .unwrap();
+
+        assert_eq!(record_to_item(&record, COLLECTION_POST, ContentType::Post).unwrap().text, None);
     }
 
     #[test]
