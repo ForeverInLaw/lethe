@@ -827,7 +827,7 @@ mod tests {
     #[test]
     fn every_subtype_a_message_gets_is_on_the_shared_list() {
         let source = include_str!("tdlib_bridge.rs");
-        let start = source.find("fn message_subtype(").unwrap();
+        let start = source.find("\nfn message_subtype(").unwrap();
         let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
         let keys: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
 

@@ -385,11 +385,14 @@ fn record_to_item(
                 .created_at
                 .as_deref()
                 .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok());
-            (v.text, ts)
+            // A post with only an image still has a text field, left empty.
+            (v.text.filter(|text| !text.is_empty()), ts)
         }
         None => (None, None),
     };
 
+    // A post listed without its files would be deleted without them, so a record
+    // that cannot be read ends the scan.
     let record = serde_json::to_value(&rec.value)
         .map_err(|e| AdapterError::Platform(format!("unreadable record: {e}")))?;
     let files = record_files(&record);
@@ -421,8 +424,7 @@ struct RecordFiles {
 
 /// Every blob a record owns, wherever it sits: images, a video and its captions,
 /// a link card's thumbnail, embed types added after this was written. A quoted
-/// post is only a reference, so its files are not picked up. A post listed without
-/// its files would be deleted without them, so failing to read a record ends the scan.
+/// post is only a reference, so its files are not picked up.
 fn record_files(record: &serde_json::Value) -> RecordFiles {
     let mut files = RecordFiles::default();
     collect_blobs(record, &mut files);
@@ -616,12 +618,23 @@ mod tests {
             "external": { "uri": "https://example.com", "title": "t", "description": "d" },
         });
 
-        assert_eq!(item_of(images).subtype, Some("photo"));
-        assert_eq!(item_of(video).subtype, Some("video"));
-        assert_eq!(item_of(quote_with_images).subtype, Some("photo"));
+        let named = [images, video, quote_with_images, link].map(|embed| item_of(embed).subtype);
+
         // A link card or a bare quote is text with an extra, not a media post.
-        assert_eq!(item_of(link).subtype, None);
-        assert!(["photo", "video"].iter().all(|key| lethe_adapter::ITEM_SUBTYPES.contains(key)));
+        assert_eq!(named, [Some("photo"), Some("video"), Some("photo"), None]);
+        assert!(named.iter().flatten().all(|key| lethe_adapter::ITEM_SUBTYPES.contains(key)));
+    }
+
+    #[test]
+    fn a_post_with_only_an_image_has_no_text() {
+        let record = serde_json::from_value(json!({
+            "uri": POST,
+            "cid": IMAGE_ONE,
+            "value": { "$type": "app.bsky.feed.post", "text": "", "createdAt": "2026-01-01T00:00:00.000Z" },
+        }))
+        .unwrap();
+
+        assert_eq!(record_to_item(&record, COLLECTION_POST, ContentType::Post).unwrap().text, None);
     }
 
     #[test]

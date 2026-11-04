@@ -18,7 +18,7 @@ pub struct UnsavedItem {
     pub subtype: Option<String>,
     pub created_at_secs: Option<i64>,
     pub text: Option<String>,
-    /// The name of its first named file, which stands in for missing text.
+    /// The name of its first named file.
     pub file_name: Option<String>,
     pub failure: FileFailure,
 }
