@@ -1052,6 +1052,8 @@ mod tests {
 
         let s = Store::open(path, "k").unwrap();
         let claimed = s.claim_pending_items("r", 10).unwrap();
+        // Windows cannot remove a database file that is still open.
+        drop(s);
         std::fs::remove_file(path).unwrap();
 
         assert_eq!(claimed[0].platform_record, None);
