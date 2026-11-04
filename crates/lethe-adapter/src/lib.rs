@@ -216,13 +216,25 @@ pub struct ItemRef {
     pub token: Option<String>,
 }
 
+/// Every key an adapter may give as `Item::subtype`. The app has a label for each,
+/// and its tests check its own list against this one.
+pub const ITEM_SUBTYPES: &[&str] = &[
+    "animation", "audio", "document", "paid_media", "photo", "sticker", "video", "video_note",
+    "voice_note", "expired_media", "location", "venue", "contact", "dice", "game", "poll", "story",
+    "checklist", "checklist_changed", "invoice", "call", "video_chat", "chat_create",
+    "chat_change_title", "chat_change_photo", "chat_delete_photo", "chat_add_members", "chat_join",
+    "chat_leave", "chat_remove_member", "chat_upgrade", "pin_message", "screenshot_taken",
+    "chat_set_theme", "auto_delete_timer", "topic_create", "topic_change", "game_score",
+    "joined_telegram", "gift", "giveaway", "payment", "unsupported", "service",
+];
+
 /// An enumerated item. In-memory only (not serialized here); the store
 /// persists its own projection.
 #[derive(Debug, Clone)]
 pub struct Item {
     pub content_type: ContentType,
     /// What the item is when its content type is too coarse, as a stable key the
-    /// app words: `photo`, `poll`, `chat_join`. None for plain text.
+    /// app words: `photo`, `poll`, `chat_join`. One of `ITEM_SUBTYPES`; None for plain text.
     pub subtype: Option<&'static str>,
     pub created_at: Option<OffsetDateTime>,
     /// Text for keyword/regex predicate (None if not applicable).

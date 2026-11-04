@@ -621,6 +621,7 @@ mod tests {
         assert_eq!(item_of(quote_with_images).subtype, Some("photo"));
         // A link card or a bare quote is text with an extra, not a media post.
         assert_eq!(item_of(link).subtype, None);
+        assert!(["photo", "video"].iter().all(|key| lethe_adapter::ITEM_SUBTYPES.contains(key)));
     }
 
     #[test]
